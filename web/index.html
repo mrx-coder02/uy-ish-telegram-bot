@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Uy ishlari</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --bg:#f4f6fb; --card:#fff; --txt:#1c2333; --muted:#7a8199;
+  --acc:#3b82f6; --acc2:#2563eb; --ok:#16a34a; --warn:#f59e0b; --bad:#dc2626;
+  --border:#e5e9f2;
+}
+body.dark{ --bg:#111622; --card:#1b2233; --txt:#e8ecf6; --muted:#8a92ab; --border:#2a3247; }
+*{box-sizing:border-box; margin:0; padding:0; font-family:-apple-system,'Segoe UI',Roboto,sans-serif;}
+body{background:var(--bg); color:var(--txt); padding-bottom:70px;}
+header{padding:14px 16px; display:flex; justify-content:space-between; align-items:center; background:var(--card); border-bottom:1px solid var(--border);}
+header h1{font-size:16px;}
+header .role{font-size:12px; color:var(--muted);}
+nav{display:flex; gap:6px; padding:10px 12px; background:var(--card); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:5; overflow-x:auto;}
+nav button{border:none; background:transparent; color:var(--muted); font-size:13px; padding:8px 12px; border-radius:10px; cursor:pointer; white-space:nowrap;}
+nav button.active{background:var(--acc); color:#fff; font-weight:600;}
+main{padding:12px;}
+.card{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:14px; margin-bottom:10px;}
+.card h3{font-size:15px; margin-bottom:6px;}
+.meta{font-size:12px; color:var(--muted); margin:3px 0;}
+.badge{display:inline-block; font-size:11px; padding:3px 8px; border-radius:8px; background:var(--border); color:var(--txt); margin-top:4px;}
+.badge.ok{background:#dcfce7; color:#166534;}
+body.dark .badge.ok{background:#14532d; color:#bbf7d0;}
+.badge.warn{background:#fef3c7; color:#92400e;}
+body.dark .badge.warn{background:#713f12; color:#fde68a;}
+.badge.bad{background:#fee2e2; color:#991b1b;}
+body.dark .badge.bad{background:#7f1d1d; color:#fecaca;}
+button.btn{background:var(--acc); color:#fff; border:none; border-radius:10px; padding:10px 14px; font-size:14px; cursor:pointer; width:100%; margin-top:8px;}
+button.btn.gray{background:var(--border); color:var(--txt);}
+button.btn.danger{background:var(--bad);}
+button.btn.small{width:auto; padding:6px 10px; font-size:12px; margin:0;}
+.row{display:flex; gap:8px; align-items:center;}
+.row .btn{flex:1;}
+input,select,textarea{width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:10px; font-size:14px; background:var(--bg); color:var(--txt); margin-top:8px; outline:none;}
+textarea{resize:vertical; min-height:70px;}
+label{font-size:12px; color:var(--muted);}
+img.hwimg{width:100%; border-radius:10px; margin-top:8px; border:1px solid var(--border);}
+.hidden{display:none !important;}
+.center{padding:40px 20px; text-align:center; color:var(--muted);}
+.perm-row{display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); font-size:13px;}
+.switch{position:relative; width:44px; height:24px; flex-shrink:0;}
+.switch input{opacity:0; width:0; height:0;}
+.slider{position:absolute; inset:0; background:var(--border); border-radius:12px; cursor:pointer; transition:.2s;}
+.slider:before{content:""; position:absolute; height:18px; width:18px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s;}
+.switch input:checked + .slider{background:var(--ok);}
+.switch input:checked + .slider:before{transform:translateX(20px);}
+.tabs2{display:flex; gap:8px; margin-bottom:10px;}
+.tabs2 button{flex:1; padding:8px; border:1px solid var(--border); background:var(--card); color:var(--txt); border-radius:10px; cursor:pointer; font-size:13px;}
+.tabs2 button.active{background:var(--acc); color:#fff; border-color:var(--acc);}
+.stat-grid{display:grid; grid-template-columns:1fr 1fr; gap:8px;}
+.stat{background:var(--bg); border:1px solid var(--border); border-radius:12px; padding:12px; text-align:center;}
+.stat b{font-size:22px; display:block;}
+.stat span{font-size:11px; color:var(--muted);}
+.empty{text-align:center; color:var(--muted); font-size:13px; padding:24px 0;}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>🏠 Uy ishlari</h1><div class="role" id="whoami">...</div></div>
+  <div class="role" id="rolename"></div>
+</header>
+
+<div id="nologin" class="hidden center card">
+  ⚠️ Siz hali tizimga kirmagansiz.<br><br>
+  Botga o'tib <b>«📱 Telefon raqam bilan kirish»</b> tugmasini bosing.<br>
+  O'qituvchi sizni ro'yxatdan o'tkazgan bo'lishi kerak.
+</div>
+
+<nav id="nav" class="hidden"></nav>
+<main id="main" class="hidden"></main>
+
+<script>
+const tg = window.Telegram.WebApp;
+tg.ready(); tg.expand();
+const H = {"X-Init-Data": tg.initDataUnsafe ? (tg.initData || "") : "", "Content-Type":"application/json"};
+if (tg.colorScheme === 'dark') document.body.classList.add('dark');
+
+let ME = null, TAB = 'hw', PAGE = 'list';
+
+async function api(path, opts={}){
+  const r = await fetch(path, {...opts, headers: {...H, ...(opts.headers||{})}});
+  if (r.status === 401 || r.status === 403) throw {auth:true};
+  const d = await r.json();
+  if (!r.ok) throw d;
+  return d;
+}
+
+function el(html){ const t=document.createElement('template'); t.innerHTML=html.trim(); return t.content.firstChild; }
+
+async function loadMe(){
+  try{
+    ME = await api('/api/me');
+    document.getElementById('whoami').textContent = ME.user.name;
+    document.getElementById('rolename').textContent = ME.user.role_name;
+    document.getElementById('nologin').classList.add('hidden');
+    document.getElementById('nav').classList.remove('hidden');
+    document.getElementById('main').classList.remove('hidden');
+    buildNav(); showTab(TAB);
+  }catch(e){
+    document.getElementById('nologin').classList.remove('hidden');
+  }
+}
+
+function buildNav(){
+  const nav = document.getElementById('nav');
+  nav.innerHTML = '';
+  const tabs = [['hw','📚 Vazifalar'],['sch','📅 Jadval']];
+  if (ME.perms.includes('add_homework')) tabs.push(['add','➕ Qo\'shish']);
+  if (ME.perms.includes('view_students')||ME.perms.includes('add_student')) tabs.push(['stu','👥 O\'quvchilar']);
+  if (ME.perms.includes('manage_permissions')||ME.perms.includes('view_stats')) tabs.push(['dev','👑 Panel']);
+  tabs.forEach(([id,label])=>{
+    const b = el(`<button data-t="${id}" class="${TAB===id?'active':''}">${label}</button>`);
+    b.onclick = ()=>{ TAB=id; PAGE='list'; buildNav(); showTab(id); };
+    nav.appendChild(b);
+  });
+}
+
+/* ---------- Vazifalar ---------- */
+async function showTab(t){
+  const m = document.getElementById('main');
+  m.innerHTML = '<div class="empty">Yuklanmoqda...</div>';
+  try{
+    if (t==='hw') return await renderHomework(m);
+    if (t==='sch') return await renderSchedule(m);
+    if (t==='add') return renderAdd(m);
+    if (t==='stu') return await renderStudents(m);
+    if (t==='dev') return await renderDev(m);
+  }catch(e){
+    if (e.auth) return loadMe();
+    m.innerHTML = `<div class="empty">Xatolik: ${e.error||e}</div>`;
+  }
+}
+
+async function renderHomework(m){
+  const d = await api('/api/homework');
+  m.innerHTML = '';
+  const isTeacher = !ME.perms.includes('submit_homework') || ME.user.role==='starosta';
+  if (!d.homework.length){ m.innerHTML = '<div class="empty">📭 Vazifalar yo\'q</div>'; return; }
+  d.homework.forEach(h=>{
+    let status = '';
+    if (h.done !== undefined) status = h.done?'<span class="badge ok">✔️ Bajarildi</span>':(h.accepted?'<span class="badge warn">✅ Qabul qilingan</span>':'<span class="badge">⏳ Kutilmoqda</span>');
+    else if (h.done_n !== undefined) status = `<span class="badge warn">✅ ${h.done_n}/${h.total} bajarilgan</span>`;
+    const card = el(`<div class="card">
+      <h3>📘 ${esc(h.subject)}</h3>
+      ${h.task?`<div class="meta">📝 ${esc(h.task)}</div>`:''}
+      ${h.photo_url?`<img class="hwimg" src="${h.photo_url}" loading="lazy">`:''}
+      <div class="meta">🗓 Muddat: ${h.due_date} · ${h.left_text}</div>
+      ${status}
+      ${h.done!==undefined && !h.done ? `<button class="btn" id="done-${h.id}">✔️ Bajarildi deb belgilash</button><button class="btn gray" id="sub-${h.id}">📤 Topshirish (rasm/matn)</button>`:''}
+      ${h.sub_photo?`<img class="hwimg" src="${h.sub_photo}">`:''}
+      ${h.sub_text?`<div class="meta">📤 Topshirdim: ${esc(h.sub_text)}</div>`:''}
+      ${h.total!==undefined?`<button class="btn gray" id="view-${h.id}">👁 O'quvchilar holati</button>`:''}
+    </div>`);
+    m.appendChild(card);
+    const bd = card.querySelector(`#done-${h.id}`);
+    if (bd) bd.onclick = async ()=>{ try{ await api('/api/done',{method:'POST', body:JSON.stringify({homework_id:h.id})}); tg.showAlert('✔️ Bajarildi deb belgilandi!'); showTab('hw'); }catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); } };
+    const bs = card.querySelector(`#sub-${h.id}`);
+    if (bs) bs.onclick = ()=> submitForm(h);
+    const bv = card.querySelector(`#view-${h.id}`);
+    if (bv) bv.onclick = ()=> viewStatus(h);
+  });
+}
+
+async function submitForm(h){
+  const m = document.getElementById('main');
+  m.innerHTML = `<div class="card">
+    <h3>📤 «${esc(h.subject)}» topshirish</h3>
+    <input type="file" id="subfile" accept="image/*" capture="environment">
+    <textarea id="subtext" placeholder="Izoh yoki matn (ixtiyoriy)"></textarea>
+    <button class="btn" id="subgo">Yuborish</button>
+    <button class="btn gray" id="subback">Orqaga</button>
+  </div>`;
+  document.getElementById('subback').onclick = ()=> showTab('hw');
+  document.getElementById('subgo').onclick = async ()=>{
+    try{
+      tg.MainButton.showProgress();
+      let photo = null;
+      const f = document.getElementById('subfile').files[0];
+      if (f) photo = await uploadFile(f);
+      await api('/api/submit',{method:'POST', body: JSON.stringify({homework_id:h.id, text:document.getElementById('subtext').value, photo_url:photo})});
+      tg.showAlert('✅ Topshirildi!');
+      showTab('hw');
+    }catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); }
+    finally{ tg.MainButton.hideProgress(); }
+  };
+}
+
+async function viewStatus(h){
+  const m = document.getElementById('main');
+  m.innerHTML = '<div class="empty">Yuklanmoqda...</div>';
+  const d = await api(`/api/homework/${h.id}/status`);
+  m.innerHTML = `<div class="card"><h3>📘 ${esc(h.subject)}</h3><div class="meta">🗓 ${h.due_date}</div></div><button class="btn gray" id="back">Orqaga</button><div id="list"></div>`;
+  document.getElementById('back').onclick = ()=> showTab('hw');
+  const list = document.getElementById('list');
+  if (!d.statuses.length) list.innerHTML = '<div class="empty">O\'quvchilar yo\'q</div>';
+  d.statuses.forEach(s=>{
+    const mark = s.done?'<span class="badge ok">✔️ Bajarildi</span>':(s.accepted?'<span class="badge warn">✅ Qabul qilgan</span>':'<span class="badge">⏳ Javob bermagan</span>');
+    const card = el(`<div class="card"><h3>${esc(s.first_name+' '+(s.last_name||''))}</h3>${mark}
+      ${s.sub_photo?`<img class="hwimg" src="${s.sub_photo}">`:''}
+      ${s.sub_text?`<div class="meta">📝 ${esc(s.sub_text)}</div>`:''}</div>`);
+    list.appendChild(card);
+  });
+}
+
+/* ---------- Jadval ---------- */
+async function renderSchedule(m){
+  const d = await api('/api/schedule');
+  const canDel = ME.perms.includes('delete_content');
+  const days = ['Dushanba','Seshanba','Chorshanba','Payshanba','Juma','Shanba','Yakshanba'];
+  m.innerHTML = `<button class="btn gray" id="today">🌅 Bugungi darslar</button><div id="schlist"></div>`;
+  const list = document.getElementById('schlist');
+  if (!d.schedule.length) list.innerHTML = '<div class="empty">📭 Jadval bo\'sh</div>';
+  days.forEach((day,i)=>{
+    const rows = d.schedule.filter(r=>r.weekday===i);
+    if (!rows.length) return;
+    const card = el(`<div class="card"><h3>—— ${day} ——</h3></div>`);
+    rows.forEach(r=>{
+      const row = el(`<div class="row meta" style="justify-content:space-between"><span>🕐 ${r.time} — ${esc(r.subject)}</span>${canDel?`<button class="btn danger small">🗑</button>`:''}</div>`);
+      if (canDel) row.querySelector('button').onclick = async ()=>{ await api('/api/schedule/'+r.id,{method:'DELETE'}); showTab('sch'); };
+      card.appendChild(row);
+    });
+    list.appendChild(card);
+  });
+  document.getElementById('today').onclick = ()=>{
+    const wd = new Date().getDay()===0?6:new Date().getDay()-1;
+    const dayName = days[wd];
+    const rows = d.schedule.filter(r=>days[r.weekday]===dayName);
+    tg.showAlert(rows.length? `Bugun (${dayName}):\n`+rows.map(r=>`${r.time} — ${r.subject}`).join('\n') : 'Bugun dars yo\'q 🎉');
+  };
+}
+
+/* ---------- Vazifa qo'shish ---------- */
+function renderAdd(m){
+  m.innerHTML = `<div class="card">
+    <div class="tabs2"><button id="tabhw" class="active">📚 Uy vazifa</button><button id="tabsch">🗓 Dars qo'shish</button></div>
+    <div id="pane1">
+      <label>Fan nomi</label><input id="f_subject" placeholder="Matematika">
+      <label>Vazifa matni (ixtiyoriy agar rasm bo'lsa)</label><textarea id="f_task" placeholder="Vazifa matni..."></textarea>
+      <label>Rasm (ixtiyoriy)</label><input type="file" id="f_img" accept="image/*" capture="environment">
+      <img id="f_preview" class="hwimg hidden">
+      <label>Muddat</label><input type="date" id="f_due">
+      <button class="btn" id="f_go">Yuborish (barcha o'quvchilarga)</button>
+    </div>
+    <div id="pane2" class="hidden">
+      <label>Hafta kuni</label><select id="s_day">${['Dushanba','Seshanba','Chorshanba','Payshanba','Juma','Shanba','Yakshanba'].map((d,i)=>`<option value="${i}">${d}</option>`).join('')}</select>
+      <label>Vaqt</label><input id="s_time" placeholder="09:00">
+      <label>Fan</label><input id="s_subj" placeholder="Matematika">
+      <button class="btn" id="s_go">Jadvalga qo'shish</button>
+    </div>
+  </div>`;
+  document.getElementById('tabhw').onclick = ()=>{ setAddTab(true) };
+  document.getElementById('tabsch').onclick = ()=>{ setAddTab(false) };
+  function setAddTab(hw){
+    document.getElementById('tabhw').classList.toggle('active', hw);
+    document.getElementById('tabsch').classList.toggle('active', !hw);
+    document.getElementById('pane1').classList.toggle('hidden', !hw);
+    document.getElementById('pane2').classList.toggle('hidden', hw);
+  }
+  document.getElementById('f_img').onchange = e=>{
+    const f = e.target.files[0];
+    if (f){ const img = document.getElementById('f_preview'); img.src = URL.createObjectURL(f); img.classList.remove('hidden'); }
+  };
+  document.getElementById('f_go').onclick = async ()=>{
+    try{
+      tg.MainButton.showProgress();
+      let photo = null;
+      const f = document.getElementById('f_img').files[0];
+      if (f) photo = await uploadFile(f);
+      await api('/api/homework',{method:'POST', body: JSON.stringify({
+        subject: document.getElementById('f_subject').value,
+        task: document.getElementById('f_task').value,
+        photo_url: photo,
+        due_date: document.getElementById('f_due').value
+      })});
+      tg.showAlert('✅ Vazifa barcha o\'quvchilarga yuborildi!');
+      showTab('hw');
+    }catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); }
+    finally{ tg.MainButton.hideProgress(); }
+  };
+  document.getElementById('s_go').onclick = async ()=>{
+    try{
+      await api('/api/schedule',{method:'POST', body: JSON.stringify({
+        weekday:+document.getElementById('s_day').value,
+        time:document.getElementById('s_time').value,
+        subject:document.getElementById('s_subj').value
+      })});
+      tg.showAlert('✅ Dars qo\'shildi!');
+      TAB='sch'; buildNav(); showTab('sch');
+    }catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); }
+  };
+}
+
+/* ---------- O'quvchilar ---------- */
+async function renderStudents(m){
+  const d = await api('/api/students');
+  const canAdd = ME.perms.includes('add_student');
+  const canRole = ME.perms.includes('set_roles');
+  const canDel = ME.perms.includes('delete_content');
+  m.innerHTML = `<div id="stlist"></div><div id="stform"></div>`;
+  const list = document.getElementById('stlist');
+  d.students.forEach(u=>{
+    const card = el(`<div class="card">
+      <h3>${esc(u.name)}</h3>
+      <div class="meta">📱 ${u.phone||'—'} · ${u.role_name} · ${u.tg_linked?'✅ Telegram bog\'langan':'⭕️ bog\'lanmagan'} · №${u.id}</div>
+    </div>`);
+    if (canRole){
+      const sel = el(`<select>${['student','starosta','teacher','developer'].map(r=>`<option value="${r}" ${u.role===r?'selected':''}>${r==='student'?"O'quvchi":r==='starosta'?'Starosta':r==='teacher'?"O'qituvchi":'Developer'}</option>`).join('')}</select>`);
+      sel.onchange = async ()=>{
+        try{ await api('/api/role',{method:'POST', body:JSON.stringify({user_id:u.id, role:sel.value})}); tg.showAlert('✅ Rol o\'zgartirildi'); loadMe(); }
+        catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); loadMe(); }
+      };
+      card.appendChild(sel);
+    }
+    if (canDel && u.role!=='developer'){
+      const b = el('<button class="btn danger">🗑 O\'chirish</button>');
+      b.onclick = async ()=>{
+        if (!confirm(`${u.name} o'chirilsinmi?`)) return;
+        try{ await api('/api/students/'+u.id,{method:'DELETE'}); showTab('stu'); }catch(e){ tg.showAlert('Xatolik'); }
+      };
+      card.appendChild(b);
+    }
+    list.appendChild(card);
+  });
+  const pendingWrap = document.getElementById('stform');
+  try{
+    if (canAdd){
+      const p = await api('/api/pending');
+      if (p.pending.length){
+        pendingWrap.appendChild(el('<div class="card"><h3>🆕 Kirish so\'rovlari</h3></div>'));
+        p.pending.forEach(req=>{
+          const c = el(`<div class="card"><div class="meta">👤 ${esc(req.full_name)} · 📱 ${esc(req.phone)}</div></div>`);
+          const row = el('<div class="row"></div>');
+          const ok = el('<button class="btn small" style="flex:1">✅ Tasdiqlash</button>');
+          const no = el('<button class="btn gray small" style="flex:1">❌ Bekor</button>');
+          ok.onclick = async ()=>{ await api('/api/pending',{method:'POST',body:JSON.stringify({id:req.id,action:'approve'})}); showTab('stu'); };
+          no.onclick = async ()=>{ await api('/api/pending',{method:'POST',body:JSON.stringify({id:req.id,action:'reject'})}); showTab('stu'); };
+          row.appendChild(ok); row.appendChild(no); c.appendChild(row);
+          pendingWrap.appendChild(c);
+        });
+      }
+    }
+  }catch(_){}
+  if (canAdd){
+    pendingWrap.appendChild(el(`<div class="card">
+      <h3>🧑‍🎓 O'quvchi qo'shish</h3>
+      <label>Telefon raqam</label><input id="n_phone" placeholder="+998901234567">
+      <label>Ism</label><input id="n_first" placeholder="Ali">
+      <label>Familiya</label><input id="n_last" placeholder="Valiyev">
+      <button class="btn" id="n_go">Qo'shish</button>
+    </div>`));
+    document.getElementById('n_go').onclick = async ()=>{
+      try{
+        await api('/api/students',{method:'POST', body:JSON.stringify({
+          phone:document.getElementById('n_phone').value,
+          first_name:document.getElementById('n_first').value,
+          last_name:document.getElementById('n_last').value
+        })});
+        tg.showAlert('✅ O\'quvchi qo\'shildi!');
+        showTab('stu');
+      }catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); }
+    };
+  }
+}
+
+/* ---------- Developer paneli ---------- */
+async function renderDev(m){
+  m.innerHTML = '<div class="empty">Yuklanmoqda...</div>';
+  const canPerms = ME.perms.includes('manage_permissions');
+  const canStats = ME.perms.includes('view_stats');
+  let html = '<div class="tabs2"><button id="dp1" class="active">👑 Ruxsatlar</button><button id="dp2">📊 Statistika</button></div><div id="dpane"></div>';
+  m.innerHTML = html;
+  document.getElementById('dp1').onclick = ()=>{ setDevTab(true) };
+  document.getElementById('dp2').onclick = ()=>{ setDevTab(false) };
+  function setDevTab(p){ document.getElementById('dp1').classList.toggle('active',p); document.getElementById('dp2').classList.toggle('active',!p); if(p) permsPane(); else statsPane(); }
+
+  async function permsPane(){
+    const pane = document.getElementById('dpane');
+    if (!canPerms){ pane.innerHTML='<div class="empty">Ruxsat yo\'q</div>'; return; }
+    const d = await api('/api/permissions');
+    const roleNames = {student:"O'quvchi", starosta:'Starosta', teacher:"O'qituvchi", developer:'Developer'};
+    let role = 'student';
+    pane.innerHTML = `<div class="card"><h3>Rol tanlang</h3><select id="roleSel">${Object.keys(roleNames).map(r=>`<option value="${r}">${roleNames[r]}</option>`).join('')}</select><div id="permList"></div><button class="btn" id="permSave">💾 Saqlash</button></div>`;
+    const draw = ()=>{
+      role = document.getElementById('roleSel').value;
+      const list = document.getElementById('permList');
+      list.innerHTML = '';
+      Object.keys(d.labels).forEach(p=>{
+        const row = el(`<div class="perm-row"><span>${d.labels[p]}</span><label class="switch"><input type="checkbox" data-p="${p}" ${d.perms[role].includes(p)?'checked':''}><span class="slider"></span></label></div>`);
+        list.appendChild(row);
+      });
+    };
+    document.getElementById('roleSel').onchange = draw;
+    draw();
+    document.getElementById('permSave').onclick = async ()=>{
+      document.querySelectorAll('#permList input').forEach(inp=>{
+        const p = inp.dataset.p;
+        const arr = d.perms[role];
+        if (inp.checked && !arr.includes(p)) arr.push(p);
+        if (!inp.checked) d.perms[role] = arr.filter(x=>x!==p);
+      });
+      try{
+        await api('/api/permissions',{method:'POST', body:JSON.stringify({perms:d.perms})});
+        tg.showAlert('✅ Ruxsatlar saqlandi!');
+        loadMe();
+      }catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); }
+    };
+  }
+
+  async function statsPane(){
+    const pane = document.getElementById('dpane');
+    if (!canStats){ pane.innerHTML='<div class="empty">Ruxsat yo\'q</div>'; return; }
+    const d = await api('/api/stats');
+    pane.innerHTML = `<div class="card"><h3>📊 Statistika</h3><div class="stat-grid">
+      <div class="stat"><b>${d.stats.users}</b><span>Foydalanuvchi</span></div>
+      <div class="stat"><b>${d.stats.students}</b><span>O'quvchi</span></div>
+      <div class="stat"><b>${d.stats.teachers}</b><span>O'qituvchi</span></div>
+      <div class="stat"><b>${d.stats.homework}</b><span>Vazifa</span></div>
+      <div class="stat"><b>${d.stats.submissions}</b><span>Topshirilgan</span></div>
+      <div class="stat"><b>${d.stats.lessons}</b><span>Dars</span></div>
+    </div></div>`;
+  }
+
+  if (canPerms) permsPane(); else statsPane();
+}
+
+/* ---------- Yordamchi ---------- */
+function esc(s){ return (s||'').toString().replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function uploadFile(file){
+  const fd = new FormData();
+  fd.append('file', file);
+  const r = await fetch('/api/upload',{method:'POST', headers:{'X-Init-Data': H['X-Init-Data']}, body:fd});
+  if (!r.ok) throw {error:'upload_fail'};
+  return (await r.json()).url;
+}
+
+loadMe();
+</script>
+</body>
+</html>

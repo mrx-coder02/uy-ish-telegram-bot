@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+uy_ishlari.db
+uploads/
+bot_out.log
+bot_err.log
+*.log
+.env
