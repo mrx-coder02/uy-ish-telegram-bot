@@ -1,10 +1,12 @@
 import datetime
+import hashlib
 import json
 import logging
 import os
 import re
 import secrets
 import sqlite3
+import time
 import uuid
 
 import httpx
@@ -20,11 +22,13 @@ from telegram.error import Forbidden
 from telegram.ext import (
     ApplicationBuilder,
     Application,
+    BasePersistence,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    PersistenceInput,
     filters,
 )
 
@@ -43,16 +47,29 @@ if os.path.exists(_ENV_PATH):
             if _sep and not _k.startswith("#"):
                 os.environ.setdefault(_k.strip(), _v.strip())
 
+# Vercel serverlari UTC'da ishlaydi; sana/vaqt hisoblari Toshkent bo'yicha bo'lsin
+os.environ.setdefault("TZ", "Asia/Tashkent")
+if hasattr(time, "tzset"):
+    time.tzset()
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DB_PATH = "uy_ishlari.db"
+# Berilsa Postgres ishlatiladi (Vercel uchun shart), aks holda lokal SQLite
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+# Telegram webhook so'rovlarini tekshirish uchun (tokendan hosil qilinadi, alohida sozlash shart emas)
+WEBHOOK_SECRET = hashlib.sha256(f"webhook:{BOT_TOKEN}".encode()).hexdigest()[:32]
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "uy-ishlari")
 
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "").strip()
+if not WEBAPP_URL and os.environ.get("VERCEL_PROJECT_PRODUCTION_URL"):
+    # Vercel'da Mini App manzili avtomatik: loyiha domeni
+    WEBAPP_URL = f"https://{os.environ['VERCEL_PROJECT_PRODUCTION_URL']}/"
 WEB_PORT = int(os.environ.get("WEB_PORT", "8000"))
-UPLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+# Vercel'da faqat /tmp ga yozish mumkin (vaqtinchalik); asosiy saqlash joyi Supabase
+UPLOADS_DIR = "/tmp/uploads" if os.environ.get("VERCEL") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 bot_app: Application | None = None
@@ -135,7 +152,112 @@ DEFAULT_PERMS = {
 }
 
 
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id INTEGER UNIQUE,
+    phone TEXT UNIQUE,
+    first_name TEXT NOT NULL,
+    last_name TEXT,
+    role TEXT NOT NULL DEFAULT 'student',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS homework(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    author_id INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    task TEXT,
+    photo_url TEXT,
+    due_date TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS homework_status(
+    homework_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    accepted INTEGER NOT NULL DEFAULT 0,
+    done INTEGER NOT NULL DEFAULT 0,
+    reminded TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(homework_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS submission(
+    homework_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    text TEXT,
+    photo_url TEXT,
+    submitted_at TEXT NOT NULL,
+    PRIMARY KEY(homework_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS schedule(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    weekday INTEGER NOT NULL,
+    time TEXT NOT NULL,
+    subject TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_requests(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id INTEGER NOT NULL,
+    phone TEXT NOT NULL,
+    full_name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ptb_state(
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY(kind, key)
+);
+"""
+# Postgres'da Telegram ID'lari 32-bitga sig'maydi, shuning uchun BIGINT
+PG_SCHEMA = SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY").replace("INTEGER", "BIGINT")
+
+
+class PgDB:
+    """Postgres'ni sqlite3 kabi ishlatish: `?` belgilari, `with db() as c`, c.execute(...).fetchone().
+    Jarayon davomida bitta ulanish qayta ishlatiladi (serverless'da har so'rovda ulanish sekin)."""
+
+    _conn = None
+
+    def _get(self):
+        if PgDB._conn is None or PgDB._conn.closed:
+            import psycopg
+            from psycopg.rows import dict_row
+
+            # prepare_threshold=None: Supabase pooler (transaction mode) prepared statement'larni qo'llamaydi
+            PgDB._conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None)
+        return PgDB._conn
+
+    def execute(self, sql, params=()):
+        import psycopg
+
+        conn = self._get()
+        fresh = conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        try:
+            return conn.execute(sql.replace("?", "%s"), params)
+        except psycopg.OperationalError:
+            # Uzilgan ulanish (masalan, pooler yopgan) — tranzaksiya boshida bo'lsa bir marta qayta ulanamiz
+            if not (fresh and conn.broken):
+                raise
+            PgDB._conn = None
+            return self._get().execute(sql.replace("?", "%s"), params)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *_):
+        conn = self._get()
+        if exc_type:
+            conn.rollback()
+        else:
+            conn.commit()
+
+
 def db():
+    if DATABASE_URL:
+        return PgDB()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
@@ -143,6 +265,10 @@ def db():
 
 
 def init_db():
+    if DATABASE_URL:
+        with db() as c:
+            c.execute(PG_SCHEMA)
+        return
     with db() as c:
         cols = [r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()]
         if cols and "phone" not in cols:
@@ -187,61 +313,7 @@ def init_db():
                 """
             )
             log.info("Eski ma'lumot bazasi yangi sxemaga ko'chirildi")
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tg_id INTEGER UNIQUE,
-                phone TEXT UNIQUE,
-                first_name TEXT NOT NULL,
-                last_name TEXT,
-                role TEXT NOT NULL DEFAULT 'student',
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS homework(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                author_id INTEGER NOT NULL,
-                subject TEXT NOT NULL,
-                task TEXT,
-                photo_url TEXT,
-                due_date TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS homework_status(
-                homework_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                accepted INTEGER NOT NULL DEFAULT 0,
-                done INTEGER NOT NULL DEFAULT 0,
-                reminded TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY(homework_id, user_id)
-            );
-            CREATE TABLE IF NOT EXISTS submission(
-                homework_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                text TEXT,
-                photo_url TEXT,
-                submitted_at TEXT NOT NULL,
-                PRIMARY KEY(homework_id, user_id)
-            );
-            CREATE TABLE IF NOT EXISTS schedule(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                weekday INTEGER NOT NULL,
-                time TEXT NOT NULL,
-                subject TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pending_requests(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tg_id INTEGER NOT NULL,
-                phone TEXT NOT NULL,
-                full_name TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS settings(
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            """
-        )
+        c.executescript(SCHEMA)
 
 
 def get_setting(key, default=None):
@@ -432,7 +504,7 @@ async def broadcast_homework(hw_id):
     for u in student_users():
         with db() as c:
             c.execute(
-                "INSERT OR IGNORE INTO homework_status(homework_id, user_id) VALUES(?,?)",
+                "INSERT INTO homework_status(homework_id, user_id) VALUES(?,?) ON CONFLICT DO NOTHING",
                 (hw_id, u["id"]),
             )
         await send_hw_to_user(bot_app.bot, hw, u)
@@ -651,10 +723,10 @@ async def pend_name(update: ContextTypes.DEFAULT_TYPE, context):
         return ConversationHandler.END
     with db() as c:
         cur = c.execute(
-            "INSERT INTO pending_requests(tg_id, phone, full_name, created_at) VALUES(?,?,?,?)",
+            "INSERT INTO pending_requests(tg_id, phone, full_name, created_at) VALUES(?,?,?,?) RETURNING id",
             (update.effective_user.id, phone, text, datetime.datetime.now().isoformat()),
         )
-        req_id = cur.lastrowid
+        req_id = cur.fetchone()["id"]
     context.user_data.clear()
     kb = InlineKeyboardMarkup(
         [
@@ -812,7 +884,7 @@ async def hw_date(update: ContextTypes.DEFAULT_TYPE, context):
     data = context.user_data["hw"]
     with db() as c:
         cur = c.execute(
-            "INSERT INTO homework(author_id, subject, task, photo_url, due_date, created_at) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO homework(author_id, subject, task, photo_url, due_date, created_at) VALUES(?,?,?,?,?,?) RETURNING id",
             (
                 data["author"]["id"],
                 data["subject"],
@@ -822,7 +894,7 @@ async def hw_date(update: ContextTypes.DEFAULT_TYPE, context):
                 datetime.datetime.now().isoformat(),
             ),
         )
-        hw_id = cur.lastrowid
+        hw_id = cur.fetchone()["id"]
     context.user_data.clear()
     left = (due - datetime.date.today()).days
     await update.message.reply_text(
@@ -910,17 +982,17 @@ async def stu_surname(update: ContextTypes.DEFAULT_TYPE, context):
     stu = context.user_data["stu"]
     with db() as c:
         cur = c.execute(
-            "INSERT INTO users(tg_id, phone, first_name, last_name, role, created_at) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO users(tg_id, phone, first_name, last_name, role, created_at) VALUES(?,?,?,?,?,?) RETURNING id",
             (None, stu["phone"], stu["name"], surname, "student", datetime.datetime.now().isoformat()),
         )
-        user_id = cur.lastrowid
+        user_id = cur.fetchone()["id"]
     # Hali muddati o'tmagan vazifalarni yangi o'quvchiga berish
     today_iso = datetime.date.today().strftime("%Y%m%d")
     with db() as c:
         c.execute(
-            "INSERT OR IGNORE INTO homework_status(homework_id, user_id) "
+            "INSERT INTO homework_status(homework_id, user_id) "
             "SELECT id, ? FROM homework "
-            "WHERE substr(due_date,7,4)||substr(due_date,4,2)||substr(due_date,1,2) >= ?",
+            "WHERE substr(due_date,7,4)||substr(due_date,4,2)||substr(due_date,1,2) >= ? ON CONFLICT DO NOTHING",
             (user_id, today_iso),
         )
     context.user_data.clear()
@@ -1565,6 +1637,8 @@ async def job_evening(context: ContextTypes.DEFAULT_TYPE):
 # ---------------- Handlerlar ro'yxati ----------------
 def register_handlers(app):
     hw_conv = ConversationHandler(
+        name="hw",
+        persistent=True,
         entry_points=[
             MessageHandler(filters.Text([BTN_ADD_HW]), hw_entry),
             CommandHandler("uyvazifa", hw_entry),
@@ -1587,6 +1661,8 @@ def register_handlers(app):
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     note_conv = ConversationHandler(
+        name="note",
+        persistent=True,
         entry_points=[
             MessageHandler(filters.Text([BTN_ADD_NOTE]), note_entry),
             CommandHandler("eslatma", note_entry),
@@ -1600,6 +1676,8 @@ def register_handlers(app):
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     stu_conv = ConversationHandler(
+        name="stu",
+        persistent=True,
         entry_points=[
             MessageHandler(filters.Text([BTN_ADD_STUDENT]), stu_entry),
             CommandHandler("oquvchi", stu_entry),
@@ -1621,6 +1699,8 @@ def register_handlers(app):
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     sch_conv = ConversationHandler(
+        name="sch",
+        persistent=True,
         entry_points=[
             MessageHandler(filters.Text([BTN_ADD_LESSON]), sch_entry),
             CommandHandler("dars", sch_entry),
@@ -1642,6 +1722,8 @@ def register_handlers(app):
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     role_conv = ConversationHandler(
+        name="role",
+        persistent=True,
         entry_points=[
             MessageHandler(filters.Text([BTN_SET_ROLE]), role_entry),
             CommandHandler("rol", role_entry),
@@ -1659,6 +1741,8 @@ def register_handlers(app):
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     pend_conv = ConversationHandler(
+        name="pend",
+        persistent=True,
         entry_points=[MessageHandler(filters.CONTACT, login_contact)],
         states={
             S_PEND_NAME: [
@@ -1669,6 +1753,8 @@ def register_handlers(app):
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     submit_conv = ConversationHandler(
+        name="submit",
+        persistent=True,
         entry_points=[CallbackQueryHandler(sub_entry, pattern=r"^sub:\d+$")],
         states={
             S_SUBMIT: [
@@ -1712,12 +1798,6 @@ def register_handlers(app):
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_menu))
 
-    local_tz = datetime.datetime.now().astimezone().tzinfo
-    app.job_queue.run_daily(job_morning, time=datetime.time(7, 30, tzinfo=local_tz), name="morning")
-    app.job_queue.run_daily(job_homework, time=datetime.time(8, 0, tzinfo=local_tz), name="hw_reminder")
-    app.job_queue.run_daily(job_lessons_reminder, time=datetime.time(19, 0, tzinfo=local_tz), name="lessons_reminder")
-    app.job_queue.run_daily(job_evening, time=datetime.time(19, 30, tzinfo=local_tz), name="evening")
-
 
 async def unknown_menu(update: ContextTypes.DEFAULT_TYPE, context):
     user = get_user_by_tg(update.effective_user.id)
@@ -1737,34 +1817,111 @@ async def on_error(update, context):
     log.error("Xatolik: %s", context.error, exc_info=context.error)
 
 
+class DBPersistence(BasePersistence):
+    """Suhbat bosqichlari va user_data bazada (ptb_state jadvali) saqlanadi.
+    Vercel'da har bir xabar alohida chaqiruv, shuning uchun xotiraga tayanib bo'lmaydi."""
+
+    def __init__(self):
+        super().__init__(
+            store_data=PersistenceInput(bot_data=False, chat_data=False, user_data=True, callback_data=False),
+            update_interval=60,
+        )
+
+    @staticmethod
+    def _load(kind):
+        with db() as c:
+            rows = c.execute("SELECT key, value FROM ptb_state WHERE kind=?", (kind,)).fetchall()
+        return {r["key"]: json.loads(r["value"]) for r in rows}
+
+    @staticmethod
+    def _save(kind, key, value):
+        with db() as c:
+            if value is None:
+                c.execute("DELETE FROM ptb_state WHERE kind=? AND key=?", (kind, key))
+            else:
+                c.execute(
+                    "INSERT INTO ptb_state(kind, key, value) VALUES(?,?,?) "
+                    "ON CONFLICT(kind, key) DO UPDATE SET value=excluded.value",
+                    (kind, key, json.dumps(value, ensure_ascii=False)),
+                )
+
+    async def get_user_data(self):
+        return {int(k): v for k, v in self._load("user").items()}
+
+    async def update_user_data(self, user_id, data):
+        self._save("user", str(user_id), dict(data) or None)
+
+    async def drop_user_data(self, user_id):
+        self._save("user", str(user_id), None)
+
+    async def get_conversations(self, name):
+        return {tuple(json.loads(k)): v for k, v in self._load(f"conv:{name}").items()}
+
+    async def update_conversation(self, name, key, new_state):
+        self._save(f"conv:{name}", json.dumps(list(key)), new_state)
+
+    # chat_data / bot_data / callback_data ishlatilmaydi
+    async def get_chat_data(self):
+        return {}
+
+    async def get_bot_data(self):
+        return {}
+
+    async def get_callback_data(self):
+        return None
+
+    async def update_chat_data(self, chat_id, data):
+        pass
+
+    async def update_bot_data(self, data):
+        pass
+
+    async def update_callback_data(self, data):
+        pass
+
+    async def drop_chat_data(self, chat_id):
+        pass
+
+    async def refresh_user_data(self, user_id, user_data):
+        pass
+
+    async def refresh_chat_data(self, chat_id, chat_data):
+        pass
+
+    async def refresh_bot_data(self, bot_data):
+        pass
+
+    async def flush(self):
+        pass
+
+
 async def post_init(app: Application):
-    """Web server (Mini App) bilan botni birga ishga tushirish."""
+    """Lokal rejim: Mini App web-serverini bot bilan birga ishga tushirish."""
     global bot_app
     bot_app = app
+    import uvicorn
     from server import create_web_app
-    from aiohttp import web
 
-    webapp = create_web_app()
-    runner = web.AppRunner(webapp)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)
-    try:
-        await site.start()
-        log.info("Mini App web-server %s-portda ishga tushdi", WEB_PORT)
-    except Exception as e:
-        log.error("Web server ishga tushmadi: %s", e)
+    server = uvicorn.Server(uvicorn.Config(create_web_app(), host="0.0.0.0", port=WEB_PORT, log_level="warning"))
+    server.install_signal_handlers = lambda: None  # Ctrl+C'ni bot boshqaradi
+    app.create_task(server.serve())
+    log.info("Mini App web-server %s-portda ishga tushdi", WEB_PORT)
 
 
 def main():
-    if "BU_YERGA" in BOT_TOKEN or not BOT_TOKEN.strip():
-        raise SystemExit(
-            "❗️ BOT_TOKEN o'zgaruvchisiga BotFather bergan tokenni qo'ying!"
-        )
+    """Lokal rejim (polling). Vercel'da bu ishlatilmaydi — kirish nuqtasi api/index.py."""
+    if not BOT_TOKEN.strip():
+        raise SystemExit("❗️ .env faylida BOT_TOKEN yo'q!")
     init_db()
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).persistence(DBPersistence()).post_init(post_init).build()
     register_handlers(app)
     app.add_error_handler(on_error)
-    log.info("Bot ishga tushdi...")
+    local_tz = datetime.datetime.now().astimezone().tzinfo
+    app.job_queue.run_daily(job_morning, time=datetime.time(7, 30, tzinfo=local_tz), name="morning")
+    app.job_queue.run_daily(job_homework, time=datetime.time(8, 0, tzinfo=local_tz), name="hw_reminder")
+    app.job_queue.run_daily(job_lessons_reminder, time=datetime.time(19, 0, tzinfo=local_tz), name="lessons_reminder")
+    app.job_queue.run_daily(job_evening, time=datetime.time(19, 30, tzinfo=local_tz), name="evening")
+    log.info("Bot ishga tushdi (lokal, polling). Diqqat: bu Vercel webhook'ini o'chiradi!")
     app.run_polling()
 
 

@@ -14,7 +14,37 @@ O'quvchi, starosta, o'qituvchi va developer rollari bilan uy vazifalari, eslatma
 - 📱 **Mini App** — Telegram ichida to'liq boshqaruv (o'quvchi uchun ham, o'qituvchi uchun ham)
 - 👑 **Developer paneli** — rollar va ruxsatlarni boshqarish (kim nima qila olishini developer belgilaydi)
 
-## 🔧 O'rnatish
+## ☁️ Vercel'ga joylash (asosiy usul)
+
+Vercel'da bot **webhook** rejimida ishlaydi: kirish nuqtasi `api/index.py`, ma'lumotlar Postgres'da.
+
+1. **Postgres oling.** Supabase → Project Settings → Database → *Connection string* → **Transaction pooler** (port `6543`) manzilini nusxalang.
+2. [vercel.com/new](https://vercel.com/new) → shu GitHub repo'ni import qiling. Framework: **Other**.
+3. **Environment Variables**:
+
+```
+BOT_TOKEN        = BotFather bergan token
+DATABASE_URL     = postgresql://postgres.xxxx:PAROL@aws-0-....pooler.supabase.com:6543/postgres
+SUPABASE_URL     = https://xxxx.supabase.co
+SUPABASE_KEY     = supabase kalit
+SUPABASE_BUCKET  = uy-ishlari
+CRON_SECRET      = istalgan-uzun-maxfiy-satr   (eslatmalar uchun shart)
+```
+
+4. **Deploy** bosing, so'ng brauzerda bir marta oching: `https://LOYIHANGIZ.vercel.app/api/setup`.
+   Javobda `"ok": true` chiqsa, webhook ulandi. Botga `/start` yozing.
+5. Birinchi bo'lib `/dev` yozib **developer** bo'ling.
+
+Mini App manzili avtomatik Vercel domeni bo'ladi (`WEBAPP_URL` shart emas).
+
+**Eslatmalar (Vercel Cron):** `/api/cron/morning` (07:30 jadval + 08:00 vazifa eslatmalari) va
+`/api/cron/evening` (19:00 dars eslatmasi + 19:30 ertangi jadval). Bepul (Hobby) tarifda cron
+belgilangan soat ichida istalgan daqiqada ishlaydi.
+
+⚠️ Vercel ishlayotganda kompyuterda `py bot.py` ni **ishga tushirmang** — u webhook'ni o'chiradi.
+Shunday bo'lsa, `/api/setup` ni qayta oching.
+
+## 💻 Lokal ishga tushirish (test uchun)
 
 ```
 py -m pip install -r requirements.txt
@@ -29,30 +59,13 @@ SUPABASE_KEY=supabase_kalit
 SUPABASE_BUCKET=uy-ishlari
 ```
 
-Supabase ixtiyoriy — bo'lmasa rasmlar `uploads/` papkasiga saqlanadi.
+`DATABASE_URL` bo'lmasa ma'lumotlar `uy_ishlari.db` (SQLite) faylida saqlanadi. Supabase ixtiyoriy — bo'lmasa rasmlar `uploads/` papkasiga saqlanadi.
 
 ```
 py bot.py
 ```
 
-Birinchi bo'lib `/dev` yozib **developer** bo'ling.
-
-## 📱 Mini App'ni ulash
-
-Mini App HTTPS manzil talab qiladi. Lokal kompyuterda test uchun tunnel oching:
-
-```
-cloudflared tunnel --url http://localhost:8000
-```
-
-yoki ngrok: `ngrok http 8000`. Keyin:
-
-```
-set WEBAPP_URL=https://tunnel-manzilingiz
-py bot.py
-```
-
-Shundan keyin barcha menyularda «📱 Mini ilova» tugmasi paydo bo'ladi. BotFather'da `/newapp` orqali ham havolani bog'lash mumkin.
+Mini App lokalda HTTPS tunnel talab qiladi (`cloudflared tunnel --url http://localhost:8000`), keyin `.env` ga `WEBAPP_URL=https://tunnel-manzilingiz` qo'shing.
 
 ## 👥 Rollar va ruxsatlar
 
@@ -73,6 +86,5 @@ Developer panelida (Mini App → 👑 Panel) har bir rol uchun ruxsatlarni yoqib
 ## 📌 Muhim
 
 - Rasmlar avval **Supabase Storage**ga yuklanadi (`uy-ishlari` bucket). Agar bucket mavjud bo'lmasa yoki ruxsat etilmasa, avtomatik lokal `uploads/` papkaga saqlanadi — bot baribir ishlaydi. Supabase'da public bucket yaratib qo'ysangiz, bulutga yuklanadi.
-- Supabase kalitlari `bot.py` boshida (`SUPABASE_URL`, `SUPABASE_KEY`, `SUPABASE_BUCKET`).
-- Web server port: `WEB_PORT` (standart 8000).
-- Ma'lumotlar `uy_ishlari.db` faylida saqlanadi, eski bazadan avtomatik migratsiya qilinadi.
+- Lokal web server porti: `WEB_PORT` (standart 8000).
+- Ma'lumotlar Vercel'da Postgres'da (`DATABASE_URL`), lokalda `uy_ishlari.db` faylida.

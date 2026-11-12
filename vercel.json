@@ -1,0 +1,14 @@
+{
+  "builds": [
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python",
+      "config": { "includeFiles": ["*.py", "web/**"] }
+    }
+  ],
+  "routes": [{ "src": "/(.*)", "dest": "api/index.py" }],
+  "crons": [
+    { "path": "/api/cron/morning", "schedule": "30 2 * * *" },
+    { "path": "/api/cron/evening", "schedule": "0 14 * * *" }
+  ]
+}

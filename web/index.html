@@ -432,9 +432,23 @@ async function renderDev(m){
 /* ---------- Yordamchi ---------- */
 function esc(s){ return (s||'').toString().replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+async function shrinkImage(file){
+  // Vercel so'rov hajmi 4.5MB bilan cheklangan: rasmni 1600px gacha kichraytirib JPEG qilamiz
+  if (!file.type.startsWith('image/')) return file;
+  try {
+    const bmp = await createImageBitmap(file);
+    const k = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
+    return blob ? new File([blob], 'rasm.jpg', {type: 'image/jpeg'}) : file;
+  } catch (e) { return file; }
+}
+
 async function uploadFile(file){
   const fd = new FormData();
-  fd.append('file', file);
+  fd.append('file', await shrinkImage(file));
   const r = await fetch('/api/upload',{method:'POST', headers:{'X-Init-Data': H['X-Init-Data']}, body:fd});
   if (!r.ok) throw {error:'upload_fail'};
   return (await r.json()).url;
