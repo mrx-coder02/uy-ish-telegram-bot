@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import re
+import urllib.parse
 
 from aiohttp import web
 
@@ -16,10 +17,8 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 # ---------------- Telegram initData tekshiruvi ----------------
 def validate_init_data(init_data: str):
-    try:
-        pairs = dict(p.split("=", 1) for p in init_data.split("&") if "=" in p)
-    except Exception:
-        return None
+    # Telegram hash'ni URL-dekodlangan qiymatlar ustidan hisoblaydi
+    pairs = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
     hash_val = pairs.pop("hash", None)
     if not hash_val:
         return None
