@@ -11,6 +11,7 @@ Yo'llar:
 """
 import hmac
 import os
+import re
 import sys
 from types import SimpleNamespace
 
@@ -36,6 +37,12 @@ async def _ensure_ready():
     """Sovuq ishga tushishda bir marta: baza jadvallari va bot ulanishi."""
     global _bot
     if _bot is None:
+        missing = [k for k in ("BOT_TOKEN", "DATABASE_URL") if not os.environ.get(k)]
+        if missing:
+            raise RuntimeError(
+                f"Vercel → Settings → Environment Variables'da yo'q: {', '.join(missing)}. "
+                "Qo'shib, Deployments → Redeploy qiling."
+            )
         core.init_db()
         bot = ExtBot(core.BOT_TOKEN)
         await bot.initialize()
@@ -93,5 +100,15 @@ _app = server.create_web_app(
 
 async def app(scope, receive, send):
     if scope["type"] == "http":
-        await _ensure_ready()
+        try:
+            await _ensure_ready()
+        except Exception as e:
+            # Sozlash xatosini sahifada ko'rsatamiz (aks holda faqat "Internal Server Error" chiqadi)
+            core.log.exception("Ishga tushishda xato")
+            msg = re.sub(r"://[^@\s]*@", "://***@", str(e))  # parol sahifaga chiqmasin
+            for secret in (core.BOT_TOKEN, os.environ.get("DATABASE_URL", "")):
+                if secret:
+                    msg = msg.replace(secret, "***")
+            await PlainTextResponse(f"Sozlash xatosi: {type(e).__name__}: {msg}", status_code=500)(scope, receive, send)
+            return
     await _app(scope, receive, send)
