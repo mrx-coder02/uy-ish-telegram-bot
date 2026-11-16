@@ -48,7 +48,7 @@ if os.path.exists(_ENV_PATH):
                 os.environ.setdefault(_k.strip(), _v.strip())
 
 # Vercel serverlari UTC'da ishlaydi; sana/vaqt hisoblari Toshkent bo'yicha bo'lsin
-os.environ.setdefault("TZ", "Asia/Tashkent")
+os.environ["TZ"] = "<+05>-5"  # Toshkent, UTC+5 (yozgi vaqt yo'q); POSIX ko'rinishi zoneinfo fayllarisiz ishlaydi
 if hasattr(time, "tzset"):
     time.tzset()
 
@@ -394,6 +394,35 @@ def all_users(roles=None, with_tg_only=False):
         return [dict(r) for r in rows]
 
 
+def assign_open_homework(user_id, conn=None):
+    """Muddati o'tmagan vazifalarni yangi foydalanuvchiga biriktirish.
+    Ochiq `with db() as c` ichidan chaqirilsa, `c` ni bering (SQLite ikkinchi ulanishda qulflanadi)."""
+    today_iso = datetime.date.today().strftime("%Y%m%d")
+    with conn or db() as c:
+        c.execute(
+            "INSERT INTO homework_status(homework_id, user_id) "
+            "SELECT id, ? FROM homework "
+            "WHERE substr(due_date,7,4)||substr(due_date,4,2)||substr(due_date,1,2) >= ? ON CONFLICT DO NOTHING",
+            (user_id, today_iso),
+        )
+
+
+async def create_user_from_tg(bot, tg_id, role):
+    """Ro'yxatda yo'q, lekin botga /start bosgan odamni Telegram ID bo'yicha qo'shish.
+    Telegram uni tanimasa (botni ishga tushirmagan) None qaytaradi."""
+    try:
+        chat = await bot.get_chat(tg_id)
+    except Exception:
+        return None
+    with db() as c:
+        user_id = c.execute(
+            "INSERT INTO users(tg_id, phone, first_name, last_name, role, created_at) VALUES(?,?,?,?,?,?) RETURNING id",
+            (tg_id, None, chat.first_name or "Foydalanuvchi", chat.last_name or "", role, datetime.datetime.now().isoformat()),
+        ).fetchone()["id"]
+    assign_open_homework(user_id)
+    return get_user_by_id(user_id)
+
+
 def student_users():
     return all_users(("student", "starosta"))
 
@@ -678,6 +707,12 @@ async def cancel(update: ContextTypes.DEFAULT_TYPE, context):
 # ---------------- Telefon bilan kirish ----------------
 async def login_contact(update: ContextTypes.DEFAULT_TYPE, context):
     contact = update.message.contact
+    if contact.user_id != update.effective_user.id:
+        await update.message.reply_text(
+            "❗️ Faqat o'zingizning raqamingizni «📱 Telefon raqam bilan kirish» tugmasi orqali yuboring.",
+            reply_markup=login_keyboard(),
+        )
+        return ConversationHandler.END
     phone = normalize_phone(contact.phone_number)
     if not phone:
         await update.message.reply_text("❗️ Telefon raqam o'qilmadi. Qayta bosing:", reply_markup=login_keyboard())
@@ -770,8 +805,9 @@ async def cb_approve(update: ContextTypes.DEFAULT_TYPE, context):
             await q.answer("Bu raqam allaqachon ro'yxatda", show_alert=True)
             return
         parts = req["full_name"].split(None, 1)
-        c.execute(
-            "INSERT INTO users(tg_id, phone, first_name, last_name, role, created_at) VALUES(?,?,?,?,?,?)",
+        c.execute("UPDATE users SET tg_id=NULL WHERE tg_id=?", (req["tg_id"],))  # tg_id UNIQUE
+        new_id = c.execute(
+            "INSERT INTO users(tg_id, phone, first_name, last_name, role, created_at) VALUES(?,?,?,?,?,?) RETURNING id",
             (
                 req["tg_id"],
                 req["phone"],
@@ -780,7 +816,8 @@ async def cb_approve(update: ContextTypes.DEFAULT_TYPE, context):
                 "student",
                 datetime.datetime.now().isoformat(),
             ),
-        )
+        ).fetchone()["id"]
+        assign_open_homework(new_id, c)
         c.execute("DELETE FROM pending_requests WHERE id=?", (req_id,))
     await q.answer("✅ O'quvchi qo'shildi!")
     try:
@@ -792,7 +829,7 @@ async def cb_approve(update: ContextTypes.DEFAULT_TYPE, context):
         await safe_send(
             bot_app.bot, req["tg_id"],
             "🎉 O'qituvchi so'rovingizni tasdiqladi! Endi botning barcha imkoniyatlari sizda.",
-            reply_markup=menu_keyboard("student"),
+            markup=menu_keyboard("student"),
         )
 
 
@@ -831,6 +868,8 @@ async def hw_entry(update: ContextTypes.DEFAULT_TYPE, context):
 
 
 async def hw_subject(update: ContextTypes.DEFAULT_TYPE, context):
+    if update.message.text.strip() == "❌ Bekor":
+        return await cancel(update, context)
     context.user_data["hw"]["subject"] = update.message.text.strip()
     await update.message.reply_text(
         "📝 Vazifa matnini yozing YOKI 📷 rasm yuboring (ikkalasi ham bo'lishi mumkin):\n"
@@ -889,7 +928,7 @@ async def hw_date(update: ContextTypes.DEFAULT_TYPE, context):
                 data["subject"],
                 data.get("task"),
                 data.get("photo_url"),
-                text,
+                due.strftime("%d.%m.%Y"),
                 datetime.datetime.now().isoformat(),
             ),
         )
@@ -913,13 +952,18 @@ async def note_entry(update: ContextTypes.DEFAULT_TYPE, context):
         await update.message.reply_text("❗️ Bu bo'lim sizga ruxsat etilmagan.")
         return ConversationHandler.END
     context.user_data["note_author"] = user
-    await update.message.reply_text("📣 Eslatma matnini yozing (barcha o'quvchilarga yuboriladi):")
+    await update.message.reply_text(
+        "📣 Eslatma matnini yozing (barcha o'quvchilarga yuboriladi):",
+        reply_markup=ReplyKeyboardMarkup([["❌ Bekor"]], resize_keyboard=True),
+    )
     return S_NOTE
 
 
 async def note_send(update: ContextTypes.DEFAULT_TYPE, context):
-    author = context.user_data.pop("note_author", None)
     text = update.message.text.strip()
+    if text == "❌ Bekor":
+        return await cancel(update, context)
+    author = context.user_data.pop("note_author", None)
     msg = (
         "📣 ESLATMA\n\n"
         f"{text}\n\n"
@@ -985,15 +1029,7 @@ async def stu_surname(update: ContextTypes.DEFAULT_TYPE, context):
             (None, stu["phone"], stu["name"], surname, "student", datetime.datetime.now().isoformat()),
         )
         user_id = cur.fetchone()["id"]
-    # Hali muddati o'tmagan vazifalarni yangi o'quvchiga berish
-    today_iso = datetime.date.today().strftime("%Y%m%d")
-    with db() as c:
-        c.execute(
-            "INSERT INTO homework_status(homework_id, user_id) "
-            "SELECT id, ? FROM homework "
-            "WHERE substr(due_date,7,4)||substr(due_date,4,2)||substr(due_date,1,2) >= ? ON CONFLICT DO NOTHING",
-            (user_id, today_iso),
-        )
+    assign_open_homework(user_id)
     context.user_data.clear()
     await update.message.reply_text(
         f"✅ O'quvchi qo'shildi: {stu['name']} {surname} ({stu['phone']})\n"
@@ -1044,6 +1080,8 @@ async def sch_time(update: ContextTypes.DEFAULT_TYPE, context):
 async def sch_subject(update: ContextTypes.DEFAULT_TYPE, context):
     data = context.user_data["sch"]
     subject = update.message.text.strip()
+    if subject == "❌ Bekor":
+        return await cancel(update, context)
     with db() as c:
         c.execute(
             "INSERT INTO schedule(weekday, time, subject) VALUES(?,?,?)",
@@ -1080,36 +1118,75 @@ async def role_entry(update: ContextTypes.DEFAULT_TYPE, context):
         await update.message.reply_text("❗️ Bu bo'lim sizga ruxsat etilmagan.")
         return ConversationHandler.END
     context.user_data["giver_role"] = user["role"]
+    users = [u for u in all_users() if u["id"] != user["id"]]
+    if user["role"] != "developer":
+        users = [u for u in users if u["role"] != "developer"]
+    # shortcut: Telegram bir xabarda ~100 tugmagacha ruxsat beradi; sinf uchun yetadi, ko'p bo'lsa sahifalash kerak
+    rows = [
+        [InlineKeyboardButton(f"{display_name(u)} · {ROLE_NAMES[u['role']]}", callback_data=f"rolepick:{u['id']}")]
+        for u in users[:90]
+    ]
     await update.message.reply_text(
-        "🆔 Rol beriladigan foydalanuvchining hisob raqamini (ID) yozing.\n"
-        "(ID raqamlarni 👥 O'quvchilar bo'limida ko'rish mumkin)"
+        "👤 Rol beriladigan foydalanuvchini ro'yxatdan tanlang\n"
+        "yoki uning Telegram ID raqamini yozing (masalan: 123456789).\n"
+        "Ro'yxatda yo'q odam avval botga /start bosgan bo'lishi kerak.\n"
+        "Bekor qilish: /cancel",
+        reply_markup=InlineKeyboardMarkup(rows) if rows else None,
     )
     return S_ROLE_ID
 
 
-async def role_id(update: ContextTypes.DEFAULT_TYPE, context):
-    try:
-        target_id = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❗️ Faqat raqam kiriting (masalan: 3):")
-        return S_ROLE_ID
-    target = get_user_by_id(target_id)
-    if not target:
-        await update.message.reply_text("❗️ Bu ID raqamli foydalanuvchi topilmadi. Qayta yozing:")
-        return S_ROLE_ID
-    if target["role"] == "developer" and context.user_data["giver_role"] != "developer":
-        await update.message.reply_text("❗️ Developer rolini faqat developer o'zgartira oladi. Boshqa ID yozing:")
-        return S_ROLE_ID
-    context.user_data["target_id"] = target_id
+async def role_ask(message, context, who):
     options = role_allowed_for_giver(context.user_data["giver_role"])
-    kb = [[ROLE_NAMES[r]] for r in options]
-    kb.append(["❌ Bekor"])
-    await update.message.reply_text(
-        f"👤 {display_name(target)} ({target['phone'] or 'telefonsiz'}) uchun rol tanlang:\n"
-        f"Hozirgi roli: {ROLE_NAMES[target['role']]}",
-        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True),
-    )
+    kb = [[ROLE_NAMES[r]] for r in options] + [["❌ Bekor"]]
+    await message.reply_text(f"👤 {who}\nQaysi rolni berasiz?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return S_ROLE_ROLE
+
+
+async def role_target_chosen(message, context, target):
+    if target["role"] == "developer" and context.user_data["giver_role"] != "developer":
+        await message.reply_text("❗️ Developer rolini faqat developer o'zgartira oladi. Boshqasini tanlang:")
+        return S_ROLE_ID
+    context.user_data["target_id"] = target["id"]
+    return await role_ask(
+        message, context,
+        f"{display_name(target)} ({target['phone'] or 'telefonsiz'})\nHozirgi roli: {ROLE_NAMES[target['role']]}",
+    )
+
+
+async def role_id(update: ContextTypes.DEFAULT_TYPE, context):
+    """Matn: Telegram ID yoki hisob raqami (№)."""
+    text = update.message.text.strip()
+    if text == "❌ Bekor":
+        return await cancel(update, context)
+    if not text.isdigit():
+        await update.message.reply_text("❗️ Telegram ID raqamini yozing yoki ro'yxatdan tanlang:")
+        return S_ROLE_ID
+    num = int(text)
+    target = get_user_by_tg(num) or get_user_by_id(num)
+    if target:
+        return await role_target_chosen(update.message, context, target)
+    try:
+        chat = await context.bot.get_chat(num)
+    except Exception:
+        await update.message.reply_text(
+            "❗️ Bu ID topilmadi. Odam avval botga /start bosgan bo'lishi kerak. Boshqa ID yozing:"
+        )
+        return S_ROLE_ID
+    context.user_data["new_tg_id"] = num
+    name = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or "Foydalanuvchi"
+    return await role_ask(update.message, context, f"{name} (yangi, Telegram ID: {num})")
+
+
+async def role_cb(update: ContextTypes.DEFAULT_TYPE, context):
+    """Ro'yxatdagi tugma: rolepick:<hisob raqami>."""
+    q = update.callback_query
+    await q.answer()
+    target = get_user_by_id(int(q.data.split(":")[1]))
+    if not target:
+        await q.message.reply_text("❗️ Foydalanuvchi topilmadi. Boshqasini tanlang:")
+        return S_ROLE_ID
+    return await role_target_chosen(q.message, context, target)
 
 
 async def role_pick(update: ContextTypes.DEFAULT_TYPE, context):
@@ -1125,19 +1202,26 @@ async def role_pick(update: ContextTypes.DEFAULT_TYPE, context):
     if role not in role_allowed_for_giver(giver):
         await update.message.reply_text("❗️ Siz bu rolni bera olmaysiz. Boshqa rol tanlang:")
         return S_ROLE_ROLE
-    target_id = context.user_data.pop("target_id")
+    new_tg_id = context.user_data.pop("new_tg_id", None)
+    target_id = context.user_data.pop("target_id", None)
     context.user_data.clear()
-    with db() as c:
-        c.execute("UPDATE users SET role=? WHERE id=?", (role, target_id))
-    target = get_user_by_id(target_id)
+    my_menu = menu_keyboard(get_user_by_tg(update.effective_user.id)["role"])
+    if new_tg_id:
+        target = await create_user_from_tg(context.bot, new_tg_id, role)
+        if not target:
+            await update.message.reply_text("❗️ Telegram bu foydalanuvchini topmadi.", reply_markup=my_menu)
+            return ConversationHandler.END
+    else:
+        with db() as c:
+            c.execute("UPDATE users SET role=? WHERE id=?", (role, target_id))
+        target = get_user_by_id(target_id)
     await update.message.reply_text(
-        f"✅ Rol o'zgartirildi: {display_name(target)} → {ROLE_NAMES[role]}",
-        reply_markup=menu_keyboard(get_user_by_tg(update.effective_user.id)["role"]),
+        f"✅ Rol berildi: {display_name(target)} → {ROLE_NAMES[role]}", reply_markup=my_menu
     )
     await safe_send(
         context.bot,
         target.get("tg_id"),
-        f"🔔 Sizning rolingiz o'zgartirildi: {ROLE_NAMES[role]}",
+        f"🔔 Sizga rol berildi: {ROLE_NAMES[role]}",
         menu_keyboard(role) if target.get("tg_id") else None,
     )
     return ConversationHandler.END
@@ -1730,6 +1814,7 @@ def register_handlers(app):
         states={
             S_ROLE_ID: [
                 CommandHandler("cancel", cancel),
+                CallbackQueryHandler(role_cb, pattern=r"^rolepick:\d+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, role_id),
             ],
             S_ROLE_ROLE: [

@@ -56,6 +56,12 @@ def require_auth(perm=None):
     return deco
 
 
+def clean_photo_url(raw):
+    """Faqat https:// yoki /uploads/ manzillar; boshqasi (masalan `x" onerror=...`) None."""
+    url = (raw or "").strip()
+    return url if url.startswith(("https://", "/uploads/")) and '"' not in url and "<" not in url else None
+
+
 def jr(data, status=200):
     return JSONResponse(data, status_code=status)
 
@@ -131,7 +137,7 @@ async def api_homework_create(request):
         return jr({"error": "bad_json"}, status=400)
     subject = (body.get("subject") or "").strip()
     task = (body.get("task") or "").strip() or None
-    photo_url = (body.get("photo_url") or "").strip() or None
+    photo_url = clean_photo_url(body.get("photo_url"))
     due = parse_due(body.get("due_date"))
     if not subject or not due or (not task and not photo_url):
         return jr({"error": "missing_fields"}, status=400)
@@ -185,7 +191,7 @@ async def api_submit(request):
         return jr({"error": "bad_json"}, status=400)
     hw_id = int(body.get("homework_id") or 0)
     text = (body.get("text") or "").strip() or None
-    photo_url = (body.get("photo_url") or "").strip() or None
+    photo_url = clean_photo_url(body.get("photo_url"))
     if not text and not photo_url:
         return jr({"error": "empty"}, status=400)
     with core.db() as c:
@@ -302,6 +308,7 @@ async def api_students(request):
                     "role": u["role"],
                     "role_name": core.ROLE_NAMES[u["role"]],
                     "tg_linked": bool(u["tg_id"]),
+                    "tg_id": u["tg_id"],
                 }
                 for u in users
             ]
@@ -321,6 +328,8 @@ async def api_students_add(request):
     role = body.get("role") or "student"
     if not phone or len(phone) < 10 or not (2 <= len(first) <= 30) or role not in core.ROLE_NAMES:
         return jr({"error": "bad_fields"}, status=400)
+    if role not in core.role_allowed_for_giver(request["user"]["role"]):
+        return jr({"error": "forbidden"}, status=403)
     if core.get_user_by_phone(phone):
         return jr({"error": "phone_exists"}, status=409)
     with core.db() as c:
@@ -329,23 +338,17 @@ async def api_students_add(request):
             (None, phone, first, last, role, datetime.datetime.now().isoformat()),
         )
         user_id = cur.fetchone()["id"]
-        today_iso = datetime.date.today().strftime("%Y%m%d")
-        c.execute(
-            "INSERT INTO homework_status(homework_id, user_id) "
-            "SELECT id, ? FROM homework "
-            "WHERE substr(due_date,7,4)||substr(due_date,4,2)||substr(due_date,1,2) >= ? ON CONFLICT DO NOTHING",
-            (user_id, today_iso),
-        )
+        core.assign_open_homework(user_id, c)
     return jr({"ok": True, "id": user_id})
 
 
-@require_auth(perm="add_student")
+@require_auth(perm="delete_content")
 async def api_students_delete(request):
     user_id = int(request.path_params["uid"])
     target = core.get_user_by_id(user_id)
     if not target:
         return jr({"error": "not_found"}, status=404)
-    if target["role"] == "developer":
+    if target["role"] == "developer" or target["role"] not in core.role_allowed_for_giver(request["user"]["role"]):
         return jr({"error": "forbidden"}, status=403)
     with core.db() as c:
         c.execute("DELETE FROM users WHERE id=?", (user_id,))
@@ -361,26 +364,35 @@ async def api_role_set(request):
         body = await request.json()
     except Exception:
         return jr({"error": "bad_json"}, status=400)
-    user_id = int(body.get("user_id") or 0)
+    try:
+        user_id = int(body.get("user_id") or 0)
+        tg_id = int(body.get("tg_id") or 0)
+    except (TypeError, ValueError):
+        return jr({"error": "bad_id"}, status=400)
     role = body.get("role")
     if role not in core.ROLE_NAMES:
         return jr({"error": "bad_role"}, status=400)
-    target = core.get_user_by_id(user_id)
-    if not target:
+    if role not in core.role_allowed_for_giver(giver["role"]):
+        return jr({"error": "forbidden"}, status=403)
+    target = core.get_user_by_id(user_id) if user_id else core.get_user_by_tg(tg_id) if tg_id else None
+    if not target and tg_id:
+        target = await core.create_user_from_tg(core.bot_app.bot, tg_id, role)
+        if not target:
+            return jr({"error": "not_started"}, status=404)  # botga /start bosmagan
+    elif not target:
         return jr({"error": "not_found"}, status=404)
-    if target["role"] == "developer" and giver["role"] != "developer":
-        return jr({"error": "forbidden"}, status=403)
-    if giver["role"] != "developer" and role not in ("student", "starosta"):
-        return jr({"error": "forbidden"}, status=403)
-    with core.db() as c:
-        c.execute("UPDATE users SET role=? WHERE id=?", (role, user_id))
+    else:
+        if target["role"] == "developer" and giver["role"] != "developer":
+            return jr({"error": "forbidden"}, status=403)
+        with core.db() as c:
+            c.execute("UPDATE users SET role=? WHERE id=?", (role, target["id"]))
     if target.get("tg_id"):
         await core.safe_send(
             core.bot_app.bot,
             target["tg_id"],
-            f"🔔 Sizning rolingiz o'zgartirildi: {core.ROLE_NAMES[role]}",
+            f"🔔 Sizga rol berildi: {core.ROLE_NAMES[role]}",
         )
-    return json_ok()
+    return jr({"ok": True, "name": core.display_name(target)})
 
 
 @require_auth(perm="manage_permissions")
@@ -417,6 +429,8 @@ async def api_pending(request):
         with core.db() as c:
             rows = c.execute("SELECT * FROM pending_requests ORDER BY id").fetchall()
         return jr({"pending": [dict(r) for r in rows]})
+    if not core.has_perm(request["user"], "add_student"):
+        return jr({"error": "forbidden"}, status=403)
     body = await request.json()
     req_id = int(body.get("id") or 0)
     action = body.get("action")
@@ -428,6 +442,7 @@ async def api_pending(request):
             exists = c.execute("SELECT 1 FROM users WHERE phone=?", (req["phone"],)).fetchone()
             if not exists:
                 parts = req["full_name"].split(None, 1)
+                c.execute("UPDATE users SET tg_id=NULL WHERE tg_id=?", (req["tg_id"],))  # tg_id UNIQUE
                 user_id = c.execute(
                     "INSERT INTO users(tg_id, phone, first_name, last_name, role, created_at) VALUES(?,?,?,?,?,?) RETURNING id",
                     (
@@ -439,13 +454,7 @@ async def api_pending(request):
                         datetime.datetime.now().isoformat(),
                     ),
                 ).fetchone()["id"]
-                today_iso = datetime.date.today().strftime("%Y%m%d")
-                c.execute(
-                    "INSERT INTO homework_status(homework_id, user_id) "
-                    "SELECT id, ? FROM homework "
-                    "WHERE substr(due_date,7,4)||substr(due_date,4,2)||substr(due_date,1,2) >= ? ON CONFLICT DO NOTHING",
-                    (user_id, today_iso),
-                )
+                core.assign_open_homework(user_id, c)
             c.execute("DELETE FROM pending_requests WHERE id=?", (req_id,))
             await core.safe_send(
                 core.bot_app.bot, req["tg_id"],

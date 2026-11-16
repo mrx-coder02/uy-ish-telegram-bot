@@ -70,6 +70,9 @@ async def webhook(request):
 
 
 async def setup(request):
+    prod = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL")
+    if prod and request.url.hostname != prod:
+        return PlainTextResponse(f"Faqat asosiy domendan oching: https://{prod}/api/setup", status_code=400)
     url = f"https://{request.url.hostname}/api/webhook"
     await _bot.set_webhook(url, secret_token=core.WEBHOOK_SECRET, allowed_updates=Update.ALL_TYPES)
     info = await _bot.get_webhook_info()

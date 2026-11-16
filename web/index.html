@@ -7,7 +7,7 @@
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root{
-  --bg:#f4f6fb; --card:#fff; --txt:#1c2333; --muted:#7a8199;
+  --bg:#f4f6fb; --card:#fff; --txt:#1c2333; --muted:#5d647a;
   --acc:#3b82f6; --acc2:#2563eb; --ok:#16a34a; --warn:#f59e0b; --bad:#dc2626;
   --border:#e5e9f2;
 }
@@ -85,8 +85,8 @@ let ME = null, TAB = 'hw', PAGE = 'list';
 
 async function api(path, opts={}){
   const r = await fetch(path, {...opts, headers: {...H, ...(opts.headers||{})}});
-  if (r.status === 401 || r.status === 403) throw {auth:true};
-  const d = await r.json();
+  const d = await r.json().catch(()=>({}));
+  if (r.status === 401 || d.error === 'not_registered') throw {auth:true};
   if (!r.ok) throw d;
   return d;
 }
@@ -149,11 +149,11 @@ async function renderHomework(m){
     const card = el(`<div class="card">
       <h3>📘 ${esc(h.subject)}</h3>
       ${h.task?`<div class="meta">📝 ${esc(h.task)}</div>`:''}
-      ${h.photo_url?`<img class="hwimg" src="${h.photo_url}" loading="lazy">`:''}
+      ${h.photo_url?`<img class="hwimg" src="${esc(h.photo_url)}" loading="lazy">`:''}
       <div class="meta">🗓 Muddat: ${h.due_date} · ${h.left_text}</div>
       ${status}
       ${h.done!==undefined && !h.done ? `<button class="btn" id="done-${h.id}">✔️ Bajarildi deb belgilash</button><button class="btn gray" id="sub-${h.id}">📤 Topshirish (rasm/matn)</button>`:''}
-      ${h.sub_photo?`<img class="hwimg" src="${h.sub_photo}">`:''}
+      ${h.sub_photo?`<img class="hwimg" src="${esc(h.sub_photo)}">`:''}
       ${h.sub_text?`<div class="meta">📤 Topshirdim: ${esc(h.sub_text)}</div>`:''}
       ${h.total!==undefined?`<button class="btn gray" id="view-${h.id}">👁 O'quvchilar holati</button>`:''}
     </div>`);
@@ -202,7 +202,7 @@ async function viewStatus(h){
   d.statuses.forEach(s=>{
     const mark = s.done?'<span class="badge ok">✔️ Bajarildi</span>':(s.accepted?'<span class="badge warn">✅ Qabul qilgan</span>':'<span class="badge">⏳ Javob bermagan</span>');
     const card = el(`<div class="card"><h3>${esc(s.first_name+' '+(s.last_name||''))}</h3>${mark}
-      ${s.sub_photo?`<img class="hwimg" src="${s.sub_photo}">`:''}
+      ${s.sub_photo?`<img class="hwimg" src="${esc(s.sub_photo)}">`:''}
       ${s.sub_text?`<div class="meta">📝 ${esc(s.sub_text)}</div>`:''}</div>`);
     list.appendChild(card);
   });
@@ -302,15 +302,36 @@ async function renderStudents(m){
   const canAdd = ME.perms.includes('add_student');
   const canRole = ME.perms.includes('set_roles');
   const canDel = ME.perms.includes('delete_content');
-  m.innerHTML = `<div id="stlist"></div><div id="stform"></div>`;
+  m.innerHTML = `<div id="rolebyid"></div><div id="stlist"></div><div id="stform"></div>`;
   const list = document.getElementById('stlist');
+  const ROLE_LABELS = {student:"O'quvchi", starosta:'Starosta', teacher:"O'qituvchi", developer:'Developer'};
+  // server bilan bir xil: developer bo'lmagan faqat o'quvchi/starosta rolini bera oladi
+  const allowedRoles = ME.user.role==='developer' ? Object.keys(ROLE_LABELS) : ['student','starosta'];
+  const roleOptions = cur => allowedRoles.concat(allowedRoles.includes(cur)||!cur ? [] : [cur])
+    .map(r=>`<option value="${r}" ${cur===r?'selected':''} ${allowedRoles.includes(r)?'':'disabled'}>${ROLE_LABELS[r]}</option>`).join('');
+  if (canRole){
+    const f = el(`<div class="card"><h3>🆔 Telegram ID bo'yicha rol berish</h3>
+      <div class="meta">Ro'yxatda yo'q odam avval botga /start bosgan bo'lishi kerak.</div>
+      <input id="rid_tg" inputmode="numeric" placeholder="Telegram ID, masalan 123456789">
+      <select id="rid_role">${roleOptions('')}</select>
+      <button class="btn" id="rid_go">✅ Rol berish</button></div>`);
+    document.getElementById('rolebyid').appendChild(f);
+    document.getElementById('rid_go').onclick = async ()=>{
+      const tgId = document.getElementById('rid_tg').value.trim();
+      if (!/^\d+$/.test(tgId)) return tg.showAlert('Telegram ID faqat raqamlardan iborat bo\'ladi');
+      try{
+        const r = await api('/api/role',{method:'POST', body:JSON.stringify({tg_id:+tgId, role:document.getElementById('rid_role').value})});
+        tg.showAlert(`✅ ${r.name} — rol berildi`); showTab('stu');
+      }catch(e){ tg.showAlert(e.error==='not_started' ? 'Bu odam botga hali /start bosmagan' : 'Xatolik: '+(e.error||e)); }
+    };
+  }
   d.students.forEach(u=>{
     const card = el(`<div class="card">
       <h3>${esc(u.name)}</h3>
-      <div class="meta">📱 ${u.phone||'—'} · ${u.role_name} · ${u.tg_linked?'✅ Telegram bog\'langan':'⭕️ bog\'lanmagan'} · №${u.id}</div>
+      <div class="meta">📱 ${esc(u.phone)||'—'} · ${u.role_name} · ${u.tg_id?'✅ TG ID: '+u.tg_id:'⭕️ Telegram bog\'lanmagan'} · №${u.id}</div>
     </div>`);
-    if (canRole){
-      const sel = el(`<select>${['student','starosta','teacher','developer'].map(r=>`<option value="${r}" ${u.role===r?'selected':''}>${r==='student'?"O'quvchi":r==='starosta'?'Starosta':r==='teacher'?"O'qituvchi":'Developer'}</option>`).join('')}</select>`);
+    if (canRole && (u.role!=='developer' || ME.user.role==='developer')){
+      const sel = el(`<select>${roleOptions(u.role)}</select>`);
       sel.onchange = async ()=>{
         try{ await api('/api/role',{method:'POST', body:JSON.stringify({user_id:u.id, role:sel.value})}); tg.showAlert('✅ Rol o\'zgartirildi'); loadMe(); }
         catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); loadMe(); }
