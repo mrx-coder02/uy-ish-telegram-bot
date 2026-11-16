@@ -226,20 +226,23 @@ class PgDB:
             import psycopg
             from psycopg.rows import dict_row
 
+            # autocommit: har so'rov 1 marta borib-keladi (BEGIN/COMMIT qo'shimcha aylanishlarsiz).
+            # shortcut: `with db()` bloki atomar emas, ko'p qadamli yozuv o'rtada uzilsa qisman qoladi.
             # prepare_threshold=None: Supabase pooler (transaction mode) prepared statement'larni qo'llamaydi
-            PgDB._conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None)
+            PgDB._conn = psycopg.connect(
+                DATABASE_URL, row_factory=dict_row, prepare_threshold=None, autocommit=True
+            )
         return PgDB._conn
 
     def execute(self, sql, params=()):
         import psycopg
 
         conn = self._get()
-        fresh = conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
         try:
             return conn.execute(sql.replace("?", "%s"), params)
         except psycopg.OperationalError:
-            # Uzilgan ulanish (masalan, pooler yopgan) — tranzaksiya boshida bo'lsa bir marta qayta ulanamiz
-            if not (fresh and conn.broken):
+            # Uzilgan ulanish (masalan, pooler yopgan) — bir marta qayta ulanamiz
+            if not conn.broken:
                 raise
             PgDB._conn = None
             return self._get().execute(sql.replace("?", "%s"), params)
@@ -247,12 +250,8 @@ class PgDB:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, *_):
-        conn = self._get()
-        if exc_type:
-            conn.rollback()
-        else:
-            conn.commit()
+    def __exit__(self, *_):
+        pass
 
 
 def db():
@@ -1827,11 +1826,15 @@ class DBPersistence(BasePersistence):
             update_interval=60,
         )
 
-    @staticmethod
-    def _load(kind):
-        with db() as c:
-            rows = c.execute("SELECT key, value FROM ptb_state WHERE kind=?", (kind,)).fetchall()
-        return {r["key"]: json.loads(r["value"]) for r in rows}
+    _cache = None
+
+    def _load(self, kind):
+        if self._cache is None:  # 8 ta alohida so'rov o'rniga bitta
+            self._cache = {}
+            with db() as c:
+                for r in c.execute("SELECT kind, key, value FROM ptb_state").fetchall():
+                    self._cache.setdefault(r["kind"], {})[r["key"]] = json.loads(r["value"])
+        return self._cache.get(kind, {})
 
     @staticmethod
     def _save(kind, key, value):
