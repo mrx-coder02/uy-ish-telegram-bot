@@ -237,6 +237,8 @@ with TestClient(entry.app) as client:
     assert s["ok"] and s["mini_app"] == "https://uy-ish.vercel.app/", s
     wh = [p for ep, p in CALLS if ep == "setWebhook"][-1]
     assert wh["url"] == "https://uy-ish.vercel.app/api/webhook" and wh["secret_token"] == core.WEBHOOK_SECRET, wh
+    mb = [p for ep, p in CALLS if ep == "setChatMenuButton"][-1]
+    assert "chat_id" not in mb and "https://uy-ish.vercel.app/" in json.dumps(mb), mb  # hamma uchun
     assert "<html" in client.get("/").text.lower()
 
 print(f"OK: hammasi o'tdi ({len(CALLS)} ta Telegram chaqiruvi)")

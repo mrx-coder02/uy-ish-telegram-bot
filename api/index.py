@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from starlette.responses import JSONResponse, PlainTextResponse  # noqa: E402
 from starlette.routing import Route  # noqa: E402
-from telegram import Update  # noqa: E402
+from telegram import MenuButtonWebApp, Update, WebAppInfo  # noqa: E402
 from telegram.ext import ApplicationBuilder, ExtBot  # noqa: E402
 
 import bot as core  # noqa: E402
@@ -75,6 +75,11 @@ async def setup(request):
         return PlainTextResponse(f"Faqat asosiy domendan oching: https://{prod}/api/setup", status_code=400)
     url = f"https://{request.url.hostname}/api/webhook"
     await _bot.set_webhook(url, secret_token=core.WEBHOOK_SECRET, allowed_updates=Update.ALL_TYPES)
+    if core.WEBAPP_URL:
+        # chat_id'siz = barcha foydalanuvchilar uchun: yozish maydoni yonidagi "📱 Ilova" tugmasi
+        await _bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp("📱 Ilova", WebAppInfo(url=core.WEBAPP_URL))
+        )
     info = await _bot.get_webhook_info()
     return JSONResponse({"ok": True, "webhook": info.url, "mini_app": core.WEBAPP_URL or None})
 
