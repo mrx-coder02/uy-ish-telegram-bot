@@ -147,25 +147,35 @@ async def api_homework_create(request):
     due = parse_due(body.get("due_date"))
     if not subject or not due or (not task and not photo_url):
         return jr({"error": "missing_fields"}, status=400)
-    with core.db() as c:
-        cur = c.execute(
-            "INSERT INTO homework(author_id, subject, task, photo_url, due_date, created_at) VALUES(?,?,?,?,?,?) RETURNING id",
-            (user["id"], subject, task, photo_url, due, datetime.datetime.now().isoformat()),
-        )
-        hw_id = cur.fetchone()["id"]
-        hw = dict(c.execute("SELECT * FROM homework WHERE id=?", (hw_id,)).fetchone())
-    await core.broadcast_homework(hw_id)
+    user_ids = body.get("user_ids")  # yo'q/None — hammaga; ro'yxat — faqat tanlanganlarga
+    if user_ids is not None:
+        students = {u["id"] for u in core.student_users()}
+        if (not isinstance(user_ids, list) or not user_ids
+                or not all(type(i) is int and i in students for i in user_ids)):  # bool ham int, shuning uchun type()
+            return jr({"error": "bad_students"}, status=400)
+        user_ids = list(dict.fromkeys(user_ids))
+    hw_id = core.save_homework(user["id"], subject, task, photo_url, due, user_ids)
+    await core.broadcast_homework(hw_id, user_ids)
     return jr({"ok": True, "id": hw_id})
 
 
-@require_auth(perm="delete_content")
+@require_auth()
 async def api_homework_delete(request):
     hw_id = int(request.path_params["hw_id"])
     with core.db() as c:
-        c.execute("DELETE FROM homework WHERE id=?", (hw_id,))
-        c.execute("DELETE FROM homework_status WHERE homework_id=?", (hw_id,))
-        c.execute("DELETE FROM submission WHERE homework_id=?", (hw_id,))
+        hw = c.execute("SELECT * FROM homework WHERE id=?", (hw_id,)).fetchone()
+    if not hw:
+        return jr({"error": "not_found"}, status=404)
+    if not core.can_delete_homework(request["user"], hw):
+        return jr({"error": "forbidden"}, status=403)
+    core.delete_homework(hw_id)
     return json_ok()
+
+
+@require_auth(perm="add_homework")
+async def api_students_brief(request):
+    """Vazifa beruvchi uchun o'quvchilar ro'yxati (faqat ism, telefonlarsiz)."""
+    return jr({"students": [{"id": u["id"], "name": core.display_name(u)} for u in core.student_users()]})
 
 
 @require_auth(perm="view_students")
@@ -506,6 +516,7 @@ ROUTES = [
     Route("/api/schedule", api_schedule_add, methods=["POST"]),
     Route("/api/schedule/{sch_id:int}", api_schedule_delete, methods=["DELETE"]),
     Route("/api/students", api_students),
+    Route("/api/students/brief", api_students_brief),
     Route("/api/students", api_students_add, methods=["POST"]),
     Route("/api/students/{uid:int}", api_students_delete, methods=["DELETE"]),
     Route("/api/role", api_role_set, methods=["POST"]),

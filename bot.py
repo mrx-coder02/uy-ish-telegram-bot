@@ -94,11 +94,13 @@ BTN_TASKS = "📋 Vazifalar"
 BTN_SET_ROLE = "👤 Rol berish"
 BTN_DEL_HW = "🗑 Uy vazifasi o'chirish"
 BTN_DEL_SCHEDULE = "🗑 Jadval o'chirish"
+BTN_HW_ALL = "👥 Hammaga"
+BTN_HW_PICK = "✅ O'quvchilarni tanlash"
 BTN_STATS = "📊 Statistika"
 BTN_LOGIN_PHONE = "📱 Telefon raqam bilan kirish"
 
 # ---- Conversation holatlari ----
-S_HW_SUBJECT, S_HW_TASK, S_HW_DATE = "hw1", "hw2", "hw3"
+S_HW_SUBJECT, S_HW_TASK, S_HW_DATE, S_HW_TARGET = "hw1", "hw2", "hw3", "hw4"
 S_NOTE = "note1"
 S_STU_PHONE, S_STU_NAME, S_STU_SURNAME = "stu1", "stu2", "stu3"
 S_SCH_DAY, S_SCH_TIME, S_SCH_SUBJ = "sch1", "sch2", "sch3"
@@ -170,7 +172,8 @@ CREATE TABLE IF NOT EXISTS homework(
     task TEXT,
     photo_url TEXT,
     due_date TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    for_all INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS homework_status(
     homework_id INTEGER NOT NULL,
@@ -272,6 +275,8 @@ def init_db():
     if DATABASE_URL:
         with db() as c:
             c.execute(PG_SCHEMA)
+            # mavjud bazalar uchun yangi ustun
+            c.execute("ALTER TABLE homework ADD COLUMN IF NOT EXISTS for_all BIGINT NOT NULL DEFAULT 1")
         return
     with db() as c:
         cols = [r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()]
@@ -318,6 +323,10 @@ def init_db():
             )
             log.info("Eski ma'lumot bazasi yangi sxemaga ko'chirildi")
         c.executescript(SCHEMA)
+        hw_cols = [r["name"] for r in c.execute("PRAGMA table_info(homework)").fetchall()]
+        for col, ddl in (("photo_url", "TEXT"), ("for_all", "INTEGER NOT NULL DEFAULT 1")):
+            if col not in hw_cols:  # eski lokal bazada yo'q ustunlar
+                c.execute(f"ALTER TABLE homework ADD COLUMN {col} {ddl}")
 
 
 def get_setting(key, default=None):
@@ -406,8 +415,8 @@ def assign_open_homework(user_id, conn=None):
     with conn or db() as c:
         c.execute(
             "INSERT INTO homework_status(homework_id, user_id) "
-            "SELECT id, ? FROM homework "
-            "WHERE substr(due_date,7,4)||substr(due_date,4,2)||substr(due_date,1,2) >= ? ON CONFLICT DO NOTHING",
+            "SELECT id, ? FROM homework WHERE for_all=1 "
+            "AND substr(due_date,7,4)||substr(due_date,4,2)||substr(due_date,1,2) >= ? ON CONFLICT DO NOTHING",
             (user_id, today_iso),
         )
 
@@ -528,20 +537,54 @@ async def send_hw_to_user(bot, hw, user, markup=True):
         log.warning("Vazifa yuborilmadi %s: %s", user.get("tg_id"), e)
 
 
-async def broadcast_homework(hw_id):
+def save_homework(author_id, subject, task, photo_url, due_date, user_ids=None):
+    """Vazifani saqlaydi. user_ids=None — hammaga, ro'yxat — faqat o'sha o'quvchilarga."""
+    with db() as c:
+        return c.execute(
+            "INSERT INTO homework(author_id, subject, task, photo_url, due_date, created_at, for_all) "
+            "VALUES(?,?,?,?,?,?,?) RETURNING id",
+            (author_id, subject, task, photo_url, due_date, datetime.datetime.now().isoformat(),
+             0 if user_ids else 1),
+        ).fetchone()["id"]
+
+
+def can_delete_homework(user, hw):
+    """O'chirish: delete_content ruxsati bor yoki vazifa muallifi."""
+    return bool(user and hw) and (has_perm(user, "delete_content") or hw["author_id"] == user["id"])
+
+
+def delete_homework(hw_id):
+    with db() as c:
+        c.execute("DELETE FROM homework WHERE id=?", (hw_id,))
+        c.execute("DELETE FROM homework_status WHERE homework_id=?", (hw_id,))
+        c.execute("DELETE FROM submission WHERE homework_id=?", (hw_id,))
+
+
+async def broadcast_homework(hw_id, user_ids=None):
+    """Vazifani biriktirish va yuborish. user_ids=None — barcha o'quvchilarga."""
     with db() as c:
         hw = c.execute("SELECT * FROM homework WHERE id=?", (hw_id,)).fetchone()
     if not hw:
         return
     hw = dict(hw)
-    # Avval hammaga bitta so'rovda: yuborish o'rtada uzilsa ham vazifa har kimning ro'yxatida bo'ladi
+    # Avval biriktiramiz: yuborish o'rtada uzilsa ham vazifa har kimning ro'yxatida bo'ladi
     with db() as c:
-        c.execute(
-            "INSERT INTO homework_status(homework_id, user_id) "
-            "SELECT ?, id FROM users WHERE role IN ('student','starosta') ON CONFLICT DO NOTHING",
+        if user_ids is None:
+            c.execute(
+                "INSERT INTO homework_status(homework_id, user_id) "
+                "SELECT ?, id FROM users WHERE role IN ('student','starosta') ON CONFLICT DO NOTHING",
+                (hw_id,),
+            )
+        else:
+            for uid in user_ids:
+                c.execute(
+                    "INSERT INTO homework_status(homework_id, user_id) VALUES(?,?) ON CONFLICT DO NOTHING",
+                    (hw_id, uid),
+                )
+        users = [dict(r) for r in c.execute(
+            "SELECT u.* FROM users u JOIN homework_status s ON s.user_id=u.id WHERE s.homework_id=?",
             (hw_id,),
-        )
-    users = student_users()
+        ).fetchall()]
     # Telegram ~30 xabar/soniyaga ruxsat beradi: 20 tadan parallel, orasida 1 soniya
     for i in range(0, len(users), 20):
         if i:
@@ -604,8 +647,12 @@ def menu_keyboard(role):
         rows2.append(BTN_ADD_LESSON)
     if rows2:
         rows.append(rows2)
-    if "delete_content" in perms.get(user_role, []) or user_role == "developer":
-        rows.append([BTN_DEL_HW, BTN_DEL_SCHEDULE])
+    can_del = "delete_content" in perms.get(user_role, []) or user_role == "developer"
+    del_row = [BTN_DEL_HW] if can_del or "add_homework" in perms.get(user_role, []) else []
+    if can_del:
+        del_row.append(BTN_DEL_SCHEDULE)
+    if del_row:
+        rows.append(del_row)
     if "view_stats" in perms.get(user_role, []) or user_role == "developer":
         rows.append([BTN_STATS])
     if WEBAPP_URL:
@@ -930,29 +977,82 @@ async def hw_date(update: ContextTypes.DEFAULT_TYPE, context):
     except ValueError:
         await update.message.reply_text("❗️ Bunday sana yo'q. Masalan: 25.10.2026. Qayta yozing:")
         return S_HW_DATE
-    data = context.user_data["hw"]
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO homework(author_id, subject, task, photo_url, due_date, created_at) VALUES(?,?,?,?,?,?) RETURNING id",
-            (
-                data["author"]["id"],
-                data["subject"],
-                data.get("task"),
-                data.get("photo_url"),
-                due.strftime("%d.%m.%Y"),
-                datetime.datetime.now().isoformat(),
-            ),
-        )
-        hw_id = cur.fetchone()["id"]
-    context.user_data.clear()
-    left = (due - datetime.date.today()).days
+    context.user_data["hw"]["due"] = due.strftime("%d.%m.%Y")
     await update.message.reply_text(
-        f"✅ Uy vazifasi qo'shildi va barcha o'quvchilarga yuborildi!\n\n"
-        f"📘 {data['subject']}\n🗓 {text}\n⏳ {max(left, 0)} kun qoldi.\n"
+        "👥 Vazifa kimga beriladi?",
+        reply_markup=ReplyKeyboardMarkup([[BTN_HW_ALL], [BTN_HW_PICK], ["❌ Bekor"]], resize_keyboard=True),
+    )
+    return S_HW_TARGET
+
+
+def hw_target_keyboard(selected):
+    # shortcut: Telegram bir xabarda ~100 tugmagacha; sinf uchun yetadi, ko'p bo'lsa sahifalash kerak
+    rows = [
+        [InlineKeyboardButton(("✅ " if u["id"] in selected else "▫️ ") + display_name(u), callback_data=f"hwsel:{u['id']}")]
+        for u in student_users()[:90]
+    ]
+    rows.append([InlineKeyboardButton(f"✔️ Tayyor ({len(selected)} ta)", callback_data="hwsel:ok")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def hw_target(update: ContextTypes.DEFAULT_TYPE, context):
+    text = update.message.text.strip()
+    if text == "❌ Bekor":
+        return await cancel(update, context)
+    if text == BTN_HW_ALL:
+        return await hw_finish(update.message, context, None)
+    if text == BTN_HW_PICK:
+        if not student_users():
+            await update.message.reply_text("📭 O'quvchilar yo'q. «👥 Hammaga» ni tanlang yoki /cancel")
+            return S_HW_TARGET
+        context.user_data["hw"]["targets"] = []
+        await update.message.reply_text(
+            "O'quvchilarni belgilang, so'ng «✔️ Tayyor» ni bosing:", reply_markup=hw_target_keyboard([])
+        )
+        return S_HW_TARGET
+    await update.message.reply_text("❗️ Tugmalardan birini tanlang:")
+    return S_HW_TARGET
+
+
+async def hw_target_cb(update: ContextTypes.DEFAULT_TYPE, context):
+    """hwsel:<o'quvchi №> — belgilash/olib tashlash; hwsel:ok — yuborish."""
+    q = update.callback_query
+    selected = context.user_data["hw"].setdefault("targets", [])
+    arg = q.data.split(":")[1]
+    if arg == "ok":
+        if not selected:
+            await q.answer("❗️ Kamida bitta o'quvchini belgilang", show_alert=True)
+            return S_HW_TARGET
+        await q.answer()
+        try:
+            await q.edit_message_reply_markup(None)
+        except Exception:
+            pass
+        return await hw_finish(q.message, context, selected)
+    uid = int(arg)
+    selected.remove(uid) if uid in selected else selected.append(uid)
+    await q.answer()
+    try:
+        await q.edit_message_reply_markup(hw_target_keyboard(selected))
+    except Exception:
+        pass
+    return S_HW_TARGET
+
+
+async def hw_finish(message, context, targets):
+    data = context.user_data["hw"]
+    context.user_data.clear()
+    hw_id = save_homework(data["author"]["id"], data["subject"], data.get("task"), data.get("photo_url"),
+                          data["due"], targets)
+    due = datetime.datetime.strptime(data["due"], "%d.%m.%Y").date()
+    whom = "barcha o'quvchilarga" if targets is None else f"{len(targets)} ta o'quvchiga"
+    await message.reply_text(
+        f"✅ Uy vazifasi qo'shildi va {whom} yuborildi!\n\n"
+        f"📘 {data['subject']}\n🗓 {data['due']}\n⏳ {max((due - datetime.date.today()).days, 0)} kun qoldi.\n"
         "Eslatmalar: 3 kun, 2 kun, 1 kun va muddat kuni o'zi avtomatik yuboriladi 🔔",
         reply_markup=menu_keyboard(data["author"]["role"]),
     )
-    await broadcast_homework(hw_id)
+    await broadcast_homework(hw_id, targets)
     return ConversationHandler.END
 
 
@@ -1375,11 +1475,16 @@ async def show_stats(update: ContextTypes.DEFAULT_TYPE, context):
 
 async def del_hw_menu(update: ContextTypes.DEFAULT_TYPE, context):
     user = get_user_by_tg(update.effective_user.id)
-    if not has_perm(user, "delete_content"):
+    if not (has_perm(user, "delete_content") or has_perm(user, "add_homework")):
         await update.message.reply_text("❗️ Bu bo'lim sizga ruxsat etilmagan.")
         return
     with db() as c:
-        rows = c.execute("SELECT * FROM homework ORDER BY id DESC LIMIT 30").fetchall()
+        if has_perm(user, "delete_content"):
+            rows = c.execute("SELECT * FROM homework ORDER BY id DESC LIMIT 30").fetchall()
+        else:  # faqat o'zi qo'shgan vazifalar
+            rows = c.execute(
+                "SELECT * FROM homework WHERE author_id=? ORDER BY id DESC LIMIT 30", (user["id"],)
+            ).fetchall()
     if not rows:
         await update.message.reply_text("📭 O'chirish uchun vazifa yo'q.")
         return
@@ -1518,14 +1623,16 @@ async def cb_view_hw(update: ContextTypes.DEFAULT_TYPE, context):
 async def cb_del_hw(update: ContextTypes.DEFAULT_TYPE, context):
     q = update.callback_query
     user = get_user_by_tg(update.effective_user.id)
-    if not has_perm(user, "delete_content"):
-        await q.answer("❗️ Ruxsat yo'q", show_alert=True)
-        return
     hw_id = int(q.data.split(":")[1])
     with db() as c:
-        c.execute("DELETE FROM homework WHERE id=?", (hw_id,))
-        c.execute("DELETE FROM homework_status WHERE homework_id=?", (hw_id,))
-        c.execute("DELETE FROM submission WHERE homework_id=?", (hw_id,))
+        hw = c.execute("SELECT * FROM homework WHERE id=?", (hw_id,)).fetchone()
+    if not hw:
+        await q.answer("Bu vazifa allaqachon o'chirilgan", show_alert=True)
+        return
+    if not can_delete_homework(user, hw):
+        await q.answer("❗️ Ruxsat yo'q", show_alert=True)
+        return
+    delete_homework(hw_id)
     await q.answer(f"🗑 {hw_id}-vazifa o'chirildi!")
     try:
         await q.edit_message_text(f"🗑 {hw_id}-vazifa o'chirildi.")
@@ -1713,19 +1820,27 @@ async def job_evening(context: ContextTypes.DEFAULT_TYPE):
     lessons = schedule_lines(tomorrow.weekday())
     with db() as c:
         due_rows = c.execute("SELECT * FROM homework WHERE due_date=?", (tomorrow.strftime("%d.%m.%Y"),)).fetchall()
-    parts = [f"🌙 Ertaga ({WEEKDAYS[tomorrow.weekday()]}) dars jadvali:"]
-    if lessons:
-        parts.append(lessons)
-    if due_rows:
-        parts.append("\n📚 Ertaga topshiriladigan uy vazifalari:")
-        for r in due_rows:
-            parts.append(f"• {r['subject']}: {r['task'] or '(rasm)'}")
-    if not lessons and not due_rows:
-        return
-    parts.append("\n👁 Uy vazifalaringizni ko'rish uchun «🏠 Uy ishlarim» tugmasini bosing.")
-    text = "\n".join(parts)
+        assigned = c.execute(
+            "SELECT s.user_id, s.homework_id FROM homework_status s JOIN homework h ON h.id=s.homework_id "
+            "WHERE h.due_date=?",
+            (tomorrow.strftime("%d.%m.%Y"),),
+        ).fetchall()
+    mine = {}
+    for r in assigned:
+        mine.setdefault(r["user_id"], set()).add(r["homework_id"])
     for u in all_users(with_tg_only=True):
-        await safe_send(context.bot, u["tg_id"], text)
+        # o'quvchi faqat o'ziga berilganlarni, o'qituvchi/developer hammasini ko'radi
+        rows = [r for r in due_rows if u["role"] not in ("student", "starosta") or r["id"] in mine.get(u["id"], ())]
+        if not lessons and not rows:
+            continue
+        parts = [f"🌙 Ertaga ({WEEKDAYS[tomorrow.weekday()]}) dars jadvali:"]
+        if lessons:
+            parts.append(lessons)
+        if rows:
+            parts.append("\n📚 Ertaga topshiriladigan uy vazifalari:")
+            parts.extend(f"• {r['subject']}: {r['task'] or '(rasm)'}" for r in rows)
+        parts.append("\n👁 Uy vazifalaringizni ko'rish uchun «🏠 Uy ishlarim» tugmasini bosing.")
+        await safe_send(context.bot, u["tg_id"], "\n".join(parts))
 
 
 # ---------------- Handlerlar ro'yxati ----------------
@@ -1750,6 +1865,11 @@ def register_handlers(app):
             S_HW_DATE: [
                 CommandHandler("cancel", cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, hw_date),
+            ],
+            S_HW_TARGET: [
+                CommandHandler("cancel", cancel),
+                CallbackQueryHandler(hw_target_cb, pattern=r"^hwsel:(\d+|ok)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, hw_target),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1880,6 +2000,8 @@ def register_handlers(app):
     app.add_handler(CallbackQueryHandler(cb_del_schedule, pattern=r"^delsch:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_approve, pattern=r"^pay:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_reject, pattern=r"^prej:\d+$"))
+    # suhbat tugagach bosilgan eski tanlash tugmalari "yuklanmoqda"da osilib qolmasin
+    app.add_handler(CallbackQueryHandler(stale_button, pattern=r"^(hwsel|rolepick):"))
 
     app.add_handler(MessageHandler(filters.Text([BTN_MY_HW]), show_my_homework))
     app.add_handler(MessageHandler(filters.Text([BTN_SCHEDULE]), show_schedule))
@@ -1892,6 +2014,10 @@ def register_handlers(app):
     app.add_handler(MessageHandler(filters.CONTACT, login_contact))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_menu))
+
+
+async def stale_button(update: ContextTypes.DEFAULT_TYPE, context):
+    await update.callback_query.answer("⌛ Bu tugma eskirgan. Bo'limni qaytadan oching.", show_alert=True)
 
 
 async def unknown_menu(update: ContextTypes.DEFAULT_TYPE, context):

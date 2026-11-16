@@ -156,6 +156,7 @@ async function renderHomework(m){
       ${h.sub_photo?`<img class="hwimg" src="${esc(h.sub_photo)}">`:''}
       ${h.sub_text?`<div class="meta">📤 Topshirdim: ${esc(h.sub_text)}</div>`:''}
       ${h.total!==undefined?`<button class="btn gray" id="view-${h.id}">👁 O'quvchilar holati</button>`:''}
+      ${ME.perms.includes('delete_content') || h.author_id===ME.user.id ? `<button class="btn danger" id="del-${h.id}">🗑 O'chirish</button>`:''}
     </div>`);
     m.appendChild(card);
     const bd = card.querySelector(`#done-${h.id}`);
@@ -164,6 +165,12 @@ async function renderHomework(m){
     if (bs) bs.onclick = ()=> submitForm(h);
     const bv = card.querySelector(`#view-${h.id}`);
     if (bv) bv.onclick = ()=> viewStatus(h);
+    const bdel = card.querySelector(`#del-${h.id}`);
+    if (bdel) bdel.onclick = ()=> tg.showConfirm(`«${h.subject}» vazifasi o'chirilsinmi?`, async ok=>{
+      if (!ok) return;
+      try{ await api('/api/homework/'+h.id,{method:'DELETE'}); showTab('hw'); }
+      catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); }
+    });
   });
 }
 
@@ -245,7 +252,10 @@ function renderAdd(m){
       <label>Rasm (ixtiyoriy)</label><input type="file" id="f_img" accept="image/*" capture="environment">
       <img id="f_preview" class="hwimg hidden">
       <label>Muddat</label><input type="date" id="f_due">
-      <button class="btn" id="f_go">Yuborish (barcha o'quvchilarga)</button>
+      <label>Kimga</label>
+      <select id="f_whom"><option value="all">👥 Barcha o'quvchilarga</option><option value="pick">✅ Tanlangan o'quvchilarga</option></select>
+      <div id="f_students" class="hidden"></div>
+      <button class="btn" id="f_go">Yuborish</button>
     </div>
     <div id="pane2" class="hidden">
       <label>Hafta kuni</label><select id="s_day">${['Dushanba','Seshanba','Chorshanba','Payshanba','Juma','Shanba','Yakshanba'].map((d,i)=>`<option value="${i}">${d}</option>`).join('')}</select>
@@ -266,7 +276,22 @@ function renderAdd(m){
     const f = e.target.files[0];
     if (f){ const img = document.getElementById('f_preview'); img.src = URL.createObjectURL(f); img.classList.remove('hidden'); }
   };
+  document.getElementById('f_whom').onchange = async e=>{
+    const box = document.getElementById('f_students');
+    box.classList.toggle('hidden', e.target.value !== 'pick');
+    if (e.target.value !== 'pick' || box.dataset.loaded) return;
+    try{
+      const d = await api('/api/students/brief');
+      box.innerHTML = d.students.length ? d.students.map(s=>
+        `<label class="perm-row"><span>${esc(s.name)}</span><input type="checkbox" value="${s.id}"></label>`).join('')
+        : '<div class="meta">O\'quvchilar yo\'q</div>';
+      box.dataset.loaded = '1';
+    }catch(err){ box.innerHTML = '<div class="meta">Ro\'yxat yuklanmadi</div>'; }
+  };
   document.getElementById('f_go').onclick = async ()=>{
+    const pick = document.getElementById('f_whom').value === 'pick';
+    const ids = [...document.querySelectorAll('#f_students input:checked')].map(i=>+i.value);
+    if (pick && !ids.length) return tg.showAlert('Kamida bitta o\'quvchini belgilang');
     try{
       tg.MainButton.showProgress();
       let photo = null;
@@ -276,9 +301,10 @@ function renderAdd(m){
         subject: document.getElementById('f_subject').value,
         task: document.getElementById('f_task').value,
         photo_url: photo,
-        due_date: document.getElementById('f_due').value
+        due_date: document.getElementById('f_due').value,
+        ...(pick ? {user_ids: ids} : {})
       })});
-      tg.showAlert('✅ Vazifa barcha o\'quvchilarga yuborildi!');
+      tg.showAlert(pick ? `✅ Vazifa ${ids.length} ta o'quvchiga yuborildi!` : '✅ Vazifa barcha o\'quvchilarga yuborildi!');
       showTab('hw');
     }catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); }
     finally{ tg.MainButton.hideProgress(); }

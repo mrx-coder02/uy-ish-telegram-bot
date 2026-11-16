@@ -147,11 +147,41 @@ with TestClient(entry.app) as client:
     sent_before = len(CALLS)
     send(last)  # Telegram bir xil update'ni qayta yubordi -> e'tiborsiz
     assert len(CALLS) == sent_before, "takroriy update qayta bajarildi"
+    assert "kimga" in last_text_to(DEV) and not q("SELECT 1 FROM homework")
+    send(upd(DEV, "👥 Hammaga"))
     hw = q("SELECT * FROM homework")
     assert len(hw) == 1 and hw[0]["subject"] == "Matematika", (hw, last_text_to(DEV))
     assert hw[0]["due_date"] == d.strftime("%d.%m.%Y"), hw[0]["due_date"]
     hw_id = hw[0]["id"]
     assert "Matematika" in last_text_to(STU), "vazifa o'quvchiga yuborilmadi"
+    assert hw[0]["for_all"] == 1
+
+    # 4c) bot: faqat tanlangan o'quvchilarga
+    stu_uid = q("SELECT id FROM users WHERE tg_id=?", (STU,))[0]["id"]
+    for t in ("/uyvazifa", "Fizika", "Masala 5", f"{d.day}.{d.month}.{d.year}", "✅ O'quvchilarni tanlash"):
+        send(upd(DEV, t))
+    send(upd(DEV, cb="hwsel:ok"))  # hech kim tanlanmagan -> rad
+    assert not q("SELECT 1 FROM homework WHERE subject='Fizika'")
+    assert [p for ep, p in CALLS if ep == "answerCallbackQuery"][-1].get("show_alert")
+    send(upd(DEV, cb=f"hwsel:{stu_uid}"))
+    mk = [p for ep, p in CALLS if ep == "editMessageReplyMarkup"][-1]["reply_markup"]
+    assert "✅" in json.dumps(mk, ensure_ascii=False), mk
+    send(upd(DEV, cb="hwsel:ok"))
+    fiz = q("SELECT * FROM homework WHERE subject='Fizika'")
+    assert len(fiz) == 1 and fiz[0]["for_all"] == 0, fiz
+    assert q("SELECT user_id FROM homework_status WHERE homework_id=?", (fiz[0]["id"],)) == [{"user_id": stu_uid}]
+    assert "Fizika" in last_text_to(STU) and "1 ta o'quvchiga" in last_text_to(DEV)
+    assert q("SELECT count(*) n FROM ptb_state")[0]["n"] == 0
+    send(upd(DEV, cb="hwsel:ok"))  # suhbat tugagach eski tugma
+    assert "eskirgan" in [p for ep, p in CALLS if ep == "answerCallbackQuery"][-1]["text"]
+    # bot: o'chirish (developer), qayta bosish
+    send(upd(STU, cb=f"delhw:{fiz[0]['id']}"))  # o'quvchi o'chira olmaydi
+    assert q("SELECT 1 FROM homework WHERE id=?", (fiz[0]["id"],))
+    send(upd(DEV, cb=f"delhw:{fiz[0]['id']}"))
+    assert not q("SELECT 1 FROM homework WHERE id=?", (fiz[0]["id"],))
+    assert not q("SELECT 1 FROM homework_status WHERE homework_id=?", (fiz[0]["id"],))
+    send(upd(DEV, cb=f"delhw:{fiz[0]['id']}"))
+    assert "allaqachon" in [p for ep, p in CALLS if ep == "answerCallbackQuery"][-1]["text"]
 
     # 4b) 6 soatdan eski suhbat bosqichi unutiladi
     send(upd(DEV, "/oquvchi"))
@@ -218,11 +248,33 @@ with TestClient(entry.app) as client:
                     "due_date": (datetime.date.today() + datetime.timedelta(days=1)).isoformat()})
     assert r.json()["ok"], r.text
     assert len(client.get("/api/homework", headers=dh).json()["homework"]) == 2
+    # Mini App: tanlanganlarga; noto'g'ri ro'yxat rad etiladi
+    tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+    base = {"subject": "Kimyo", "task": "Tajriba", "due_date": tomorrow}
+    for bad_ids in ([], [999999], "x", [True]):
+        assert client.post("/api/homework", headers=dh, json={**base, "user_ids": bad_ids}).status_code == 400, bad_ids
+    assert client.get("/api/students/brief", headers=sh).status_code == 403
+    brief = client.get("/api/students/brief", headers=dh).json()["students"]
+    assert brief == [{"id": stu_uid, "name": "Ali Valiyev"}], brief
+    r = client.post("/api/homework", headers=dh, json={**base, "user_ids": [stu_uid, stu_uid]})
+    kimyo = r.json()["id"]
+    assert q("SELECT user_id FROM homework_status WHERE homework_id=?", (kimyo,)) == [{"user_id": stu_uid}]
     r = client.post("/api/students", headers=dh, json={"phone": "+998907777777", "first_name": "Vali",
                     "last_name": "Aliyev"})
     assert r.json()["ok"], r.text
     new_id = r.json()["id"]
+    # yangi o'quvchi faqat "hammaga" vazifalarni oladi (Matematika, Ona tili), Kimyo'ni emas
     assert q("SELECT count(*) n FROM homework_status WHERE user_id=?", (new_id,))[0]["n"] == 2
+    vali_hw = client.post("/api/homework", headers=dh, json={**base, "subject": "Biologiya", "user_ids": [new_id]}).json()["id"]
+    # Mini App: o'chirish — muallif (starosta) o'zinikini, boshqasinikini emas
+    with core.db() as c:
+        c.execute("UPDATE users SET role='starosta' WHERE id=?", (stu_uid,))
+    own = client.post("/api/homework", headers=sh, json={**base, "subject": "Starosta vazifasi"}).json()["id"]
+    assert client.delete(f"/api/homework/{kimyo}", headers=sh).status_code == 403
+    assert client.delete(f"/api/homework/{own}", headers=sh).json()["ok"]
+    assert client.delete(f"/api/homework/{own}", headers=sh).status_code == 404
+    with core.db() as c:
+        c.execute("UPDATE users SET role='student' WHERE id=?", (stu_uid,))
     assert client.post("/api/submit", headers=sh, json={"homework_id": hw_id, "text": "Bajardim"}).json()["ok"]
     # XSS: zararli photo_url qabul qilinmaydi
     bad = 'x" onerror="alert(1)'
@@ -242,8 +294,13 @@ with TestClient(entry.app) as client:
     assert client.get("/api/cron/morning").status_code == 401
     r = client.get("/api/cron/morning", headers={"Authorization": "Bearer cronsecret"})
     assert r.json()["ran"] == ["job_morning", "job_homework"], r.text
+    n0 = len(CALLS)
     r = client.get("/api/cron/evening", headers={"Authorization": "Bearer cronsecret"})
     assert r.json()["ran"] == ["job_lessons_reminder", "job_evening"], r.text
+    eve = {str(p.get("chat_id")): p.get("text", "") for ep, p in CALLS[n0:] if "Ertaga topshiriladigan" in p.get("text", "")}
+    # Biologiya faqat Vali'ga (Telegram'siz) berilgan: Ali ko'rmaydi, developer ko'radi
+    assert "Kimyo" in eve[str(STU)] and "Biologiya" not in eve[str(STU)], eve
+    assert "Biologiya" in eve[str(DEV)], eve
     r = client.get("/api/cron/evening", headers={"Authorization": "Bearer cronsecret"})
     assert "skipped" in r.json(), "cron bir kunda ikki marta ishladi"
     assert client.get("/api/cron/xyz", headers={"Authorization": "Bearer cronsecret"}).status_code == 404
