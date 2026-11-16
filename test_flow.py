@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import sys
+import time
 import urllib.parse
 
 assert "supabase" not in os.environ.get("DATABASE_URL", ""), "Test haqiqiy bazaga yozadi — faqat bo'sh test bazasida ishlating"
@@ -80,7 +81,7 @@ def upd(user_id, text=None, contact=None, cb=None):
 
 
 def init_data(user_id):
-    fields = {"auth_date": "1700000000", "user": json.dumps({"id": user_id, "first_name": "X"})}
+    fields = {"auth_date": str(int(time.time())), "user": json.dumps({"id": user_id, "first_name": "X"})}
     dcs = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
     secret = hmac.new(b"WebAppData", b"123:TEST", hashlib.sha256).digest()
     fields["hash"] = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
@@ -139,13 +140,27 @@ with TestClient(entry.app) as client:
 
     # 4) uy vazifa qo'shish (suhbat) -> o'quvchiga yuboriladi; sana nolsiz yozilsa ham dd.mm.yyyy saqlanadi
     d = datetime.date.today() + datetime.timedelta(days=3)
-    for t in ("/uyvazifa", "Matematika", "1-10 misollar", f"{d.day}.{d.month}.{d.year}"):
+    for t in ("/uyvazifa", "Matematika", "1-10 misollar"):
         send(upd(DEV, t))
+    last = upd(DEV, f"{d.day}.{d.month}.{d.year}")
+    send(last)
+    sent_before = len(CALLS)
+    send(last)  # Telegram bir xil update'ni qayta yubordi -> e'tiborsiz
+    assert len(CALLS) == sent_before, "takroriy update qayta bajarildi"
     hw = q("SELECT * FROM homework")
     assert len(hw) == 1 and hw[0]["subject"] == "Matematika", (hw, last_text_to(DEV))
     assert hw[0]["due_date"] == d.strftime("%d.%m.%Y"), hw[0]["due_date"]
     hw_id = hw[0]["id"]
     assert "Matematika" in last_text_to(STU), "vazifa o'quvchiga yuborilmadi"
+
+    # 4b) 6 soatdan eski suhbat bosqichi unutiladi
+    send(upd(DEV, "/oquvchi"))
+    with core.db() as c:
+        c.execute("UPDATE ptb_state SET value=? WHERE kind='conv:stu'", (json.dumps({"v": "stu1", "t": 0}),))
+    send(upd(DEV, "+998901111111"))
+    assert not q("SELECT 1 FROM users WHERE phone='+998901111111'") and not q("SELECT 1 FROM ptb_state WHERE kind='conv:stu'")
+    send(upd(DEV, "Ism"))  # suhbat davom etmaydi
+    assert not q("SELECT 1 FROM users WHERE first_name='Ism'")
 
     # 5) tugma: bajarildi
     send(upd(STU, cb=f"done:{hw_id}"))
@@ -229,6 +244,8 @@ with TestClient(entry.app) as client:
     assert r.json()["ran"] == ["job_morning", "job_homework"], r.text
     r = client.get("/api/cron/evening", headers={"Authorization": "Bearer cronsecret"})
     assert r.json()["ran"] == ["job_lessons_reminder", "job_evening"], r.text
+    r = client.get("/api/cron/evening", headers={"Authorization": "Bearer cronsecret"})
+    assert "skipped" in r.json(), "cron bir kunda ikki marta ishladi"
     assert client.get("/api/cron/xyz", headers={"Authorization": "Bearer cronsecret"}).status_code == 404
 
     # 8) setup va Mini App sahifasi

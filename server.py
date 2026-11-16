@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import re
+import time
 import urllib.parse
 
 from starlette.applications import Starlette
@@ -29,6 +30,11 @@ def validate_init_data(init_data: str):
     secret = hmac.new(b"WebAppData", core.BOT_TOKEN.encode(), hashlib.sha256).digest()
     calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(calc, hash_val):
+        return None
+    try:
+        if time.time() - int(pairs.get("auth_date", 0)) > 24 * 3600:
+            return None
+    except ValueError:
         return None
     try:
         return json.loads(pairs.get("user", "{}"))

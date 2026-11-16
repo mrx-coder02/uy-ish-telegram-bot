@@ -18,7 +18,7 @@ def make_init_data(token, fields):
 
 
 token = server.core.BOT_TOKEN
-fields = {"auth_date": "1700000000", "query_id": "AAH",
+fields = {"auth_date": str(int(__import__("time").time())), "query_id": "AAH",
           "user": json.dumps({"id": 123, "first_name": "Ali Valiyev"})}
 
 good = make_init_data(token, fields)
@@ -29,5 +29,7 @@ assert server.validate_init_data(tampered) is None
 assert server.validate_init_data(make_init_data("000:boshqa", fields)) is None
 assert server.validate_init_data("") is None
 assert server.validate_init_data("garbage") is None
+# 24 soatdan eski initData rad etiladi
+assert server.validate_init_data(make_init_data(token, dict(fields, auth_date="1700000000"))) is None
 
 print("OK: initData tekshiruvi to'g'ri ishlayapti")

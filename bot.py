@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import hashlib
 import json
@@ -203,6 +204,10 @@ CREATE TABLE IF NOT EXISTS pending_requests(
 CREATE TABLE IF NOT EXISTS settings(
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS processed_updates(
+    update_id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS ptb_state(
     kind TEXT NOT NULL,
@@ -529,13 +534,19 @@ async def broadcast_homework(hw_id):
     if not hw:
         return
     hw = dict(hw)
-    for u in student_users():
-        with db() as c:
-            c.execute(
-                "INSERT INTO homework_status(homework_id, user_id) VALUES(?,?) ON CONFLICT DO NOTHING",
-                (hw_id, u["id"]),
-            )
-        await send_hw_to_user(bot_app.bot, hw, u)
+    # Avval hammaga bitta so'rovda: yuborish o'rtada uzilsa ham vazifa har kimning ro'yxatida bo'ladi
+    with db() as c:
+        c.execute(
+            "INSERT INTO homework_status(homework_id, user_id) "
+            "SELECT ?, id FROM users WHERE role IN ('student','starosta') ON CONFLICT DO NOTHING",
+            (hw_id,),
+        )
+    users = student_users()
+    # Telegram ~30 xabar/soniyaga ruxsat beradi: 20 tadan parallel, orasida 1 soniya
+    for i in range(0, len(users), 20):
+        if i:
+            await asyncio.sleep(1)
+        await asyncio.gather(*(send_hw_to_user(bot_app.bot, hw, u) for u in users[i:i + 20]))
 
 
 # ---------------- Rasm saqlash (Supabase + lokal zaxira) ----------------
@@ -1912,13 +1923,22 @@ class DBPersistence(BasePersistence):
         )
 
     _cache = None
+    TTL = 6 * 3600  # shu vaqtdan eski suhbat bosqichi va user_data e'tiborga olinmaydi
 
     def _load(self, kind):
         if self._cache is None:  # 8 ta alohida so'rov o'rniga bitta
-            self._cache = {}
+            self._cache, stale = {}, []
             with db() as c:
                 for r in c.execute("SELECT kind, key, value FROM ptb_state").fetchall():
-                    self._cache.setdefault(r["kind"], {})[r["key"]] = json.loads(r["value"])
+                    v = json.loads(r["value"])
+                    if not (isinstance(v, dict) and v.keys() == {"v", "t"}):
+                        v = {"v": v, "t": 0}  # vaqtsiz eski yozuv -> eskirgan
+                    if time.time() - v["t"] > self.TTL:
+                        stale.append((r["kind"], r["key"]))
+                    else:
+                        self._cache.setdefault(r["kind"], {})[r["key"]] = v["v"]
+                for k in stale:
+                    c.execute("DELETE FROM ptb_state WHERE kind=? AND key=?", k)
         return self._cache.get(kind, {})
 
     @staticmethod
@@ -1930,7 +1950,7 @@ class DBPersistence(BasePersistence):
                 c.execute(
                     "INSERT INTO ptb_state(kind, key, value) VALUES(?,?,?) "
                     "ON CONFLICT(kind, key) DO UPDATE SET value=excluded.value",
-                    (kind, key, json.dumps(value, ensure_ascii=False)),
+                    (kind, key, json.dumps({"v": value, "t": int(time.time())}, ensure_ascii=False)),
                 )
 
     async def get_user_data(self):

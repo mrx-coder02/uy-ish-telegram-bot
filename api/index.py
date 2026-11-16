@@ -9,6 +9,7 @@ Yo'llar:
   GET  /api/cron/morning     → 07:30 va 08:00 eslatmalari (Vercel Cron)
   GET  /api/cron/evening     → 19:00 va 19:30 eslatmalari (Vercel Cron)
 """
+import datetime
 import hmac
 import os
 import re
@@ -55,6 +56,14 @@ async def webhook(request):
     if not hmac.compare_digest(token, core.WEBHOOK_SECRET):
         return PlainTextResponse("forbidden", status_code=403)
     data = await request.json()
+    with core.db() as c:  # Telegram javobni kutmay qayta yuborsa, ikkinchi marta bajarmaymiz
+        fresh = c.execute(
+            "INSERT INTO processed_updates(update_id, created_at) VALUES(?,?) "
+            "ON CONFLICT DO NOTHING RETURNING update_id",
+            (data.get("update_id"), datetime.datetime.now().isoformat()),
+        ).fetchone()
+    if not fresh:
+        return PlainTextResponse("ok")
     # Har so'rovda yangi Application: suhbat holati bazadan yangidan o'qiladi
     # (bir nechta serverless nusxa bir vaqtda ishlasa ham holat to'g'ri bo'ladi)
     app = (
@@ -91,6 +100,19 @@ async def cron(request):
     jobs = CRON_JOBS.get(request.path_params["name"])
     if not jobs:
         return PlainTextResponse("not found", status_code=404)
+    today = datetime.date.today()
+    with core.db() as c:
+        # Vercel cron'i ba'zan ikki marta ishga tushadi: har ish kuniga bir marta
+        first = c.execute(
+            "INSERT INTO settings(key, value) VALUES(?, '1') ON CONFLICT DO NOTHING RETURNING key",
+            (f"cron:{request.path_params['name']}:{today.isoformat()}",),
+        ).fetchone()
+        c.execute(
+            "DELETE FROM processed_updates WHERE created_at < ?",
+            ((today - datetime.timedelta(days=3)).isoformat(),),
+        )
+    if not first:
+        return JSONResponse({"ok": True, "skipped": "bugun allaqachon bajarilgan"})
     ctx = SimpleNamespace(bot=_bot)  # job_* funksiyalari faqat context.bot ishlatadi
     for job in jobs:
         await job(ctx)
