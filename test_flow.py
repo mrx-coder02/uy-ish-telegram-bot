@@ -9,6 +9,7 @@ Ishga tushirish (Docker, bo'sh test bazasi bilan — haqiqiy bazada EMAS):
 import datetime
 import hashlib
 import hmac
+import io
 import json
 import os
 import sys
@@ -29,10 +30,19 @@ CALLS = []
 _mid = [0]
 
 
+FILES = {}  # Telegram'dagi "yuklangan" fayllar: file_id -> bytes
+
+
 async def fake_do_request(self, url, method, request_data=None, **kw):
+    if "/file/bot" in url:  # fayl yuklab olish
+        return 200, FILES[url.rsplit("/", 1)[-1]]
     ep = url.rsplit("/", 1)[-1]
     p = dict(request_data.parameters) if request_data else {}
     CALLS.append((ep, p))
+    if ep == "getFile":
+        fid = p["file_id"]
+        res = {"file_id": fid, "file_unique_id": fid, "file_size": len(FILES[fid]), "file_path": f"documents/{fid}"}
+        return 200, json.dumps({"ok": True, "result": res}).encode()
     _mid[0] += 1
     if ep == "getChat":
         if int(p["chat_id"]) == 444:  # botga /start bosmagan odam
@@ -63,7 +73,7 @@ DEV, STU = 111, 222
 _uid = [0]
 
 
-def upd(user_id, text=None, contact=None, cb=None):
+def upd(user_id, text=None, contact=None, cb=None, doc=None):
     _uid[0] += 1
     frm = {"id": user_id, "is_bot": False, "first_name": f"U{user_id}"}
     chat = {"id": user_id, "type": "private"}
@@ -73,6 +83,10 @@ def upd(user_id, text=None, contact=None, cb=None):
     m = {"message_id": _uid[0], "date": 0, "chat": chat, "from": frm}
     if contact:
         m["contact"] = contact
+    elif doc:  # (fayl_nomi, bytes)
+        fid = f"f{_uid[0]}"
+        FILES[fid] = doc[1]
+        m["document"] = {"file_id": fid, "file_unique_id": fid, "file_name": doc[0], "file_size": len(doc[1])}
     else:
         m["text"] = text
         if text.startswith("/"):
@@ -304,6 +318,49 @@ with TestClient(entry.app) as client:
     r = client.get("/api/cron/evening", headers={"Authorization": "Bearer cronsecret"})
     assert "skipped" in r.json(), "cron bir kunda ikki marta ishladi"
     assert client.get("/api/cron/xyz", headers={"Authorization": "Bearer cronsecret"}).status_code == 404
+
+    # 7b) Dars jadvalini fayldan yuklash
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    for r in (["Vaqt", "Dushanba", "Seshanba"], ["08:00", "Matematika", "Fizika"], ["08:50", "Tarix", None]):
+        wb.active.append(r)
+    buf = io.BytesIO()
+    wb.save(buf)
+    xlsx = buf.getvalue()
+    sched = lambda: [(r["weekday"], r["time"], r["subject"]) for r in q("SELECT * FROM schedule ORDER BY weekday, time")]
+    with core.db() as c:
+        c.execute("DELETE FROM schedule")
+        c.execute("INSERT INTO schedule(weekday, time, subject) VALUES(6, '10:00', 'Eski dars')")
+    send(upd(STU, doc=("jadval.xlsx", xlsx)))  # o'quvchi jadval yuklay olmaydi
+    assert "qabul qilinmaydi" in last_text_to(STU) and len(sched()) == 1
+    send(upd(DEV, doc=("rasm.pdf", b"%PDF")))
+    assert "Faqat Excel" in last_text_to(DEV)
+    send(upd(DEV, doc=("jadval.xlsx", xlsx)))
+    assert "3 ta dars topildi" in last_text_to(DEV) and len(sched()) == 1, last_text_to(DEV)  # avval ko'rsatadi
+    send(upd(DEV, cb="schimp:append"))
+    assert sched() == [(0, "08:00", "Matematika"), (0, "08:50", "Tarix"), (1, "08:00", "Fizika"),
+                       (6, "10:00", "Eski dars")], sched()
+    send(upd(DEV, cb="schimp:append"))  # qayta bosish
+    assert "eskirgan" in [p for ep, p in CALLS if ep == "answerCallbackQuery"][-1]["text"] and len(sched()) == 4
+    send(upd(DEV, doc=("j.csv", "Kun;Vaqt;Fan\nJuma;11:00;Musiqa\n".encode())))
+    send(upd(DEV, cb="schimp:replace"))
+    assert sched() == [(4, "11:00", "Musiqa")], sched()
+    send(upd(DEV, doc=("j.csv", "Kun;Vaqt;Fan\nJuma;12:00;Rasm\n".encode())))
+    send(upd(DEV, cb="schimp:cancel"))
+    assert sched() == [(4, "11:00", "Musiqa")] and q("SELECT count(*) n FROM ptb_state")[0]["n"] == 0
+    # Mini App: oldindan ko'rish, keyin saqlash
+    files = {"file": ("jadval.xlsx", xlsx, "application/octet-stream")}
+    assert client.post("/api/schedule/parse", headers=sh, files=files).status_code == 403
+    r = client.post("/api/schedule/parse", headers=dh, files=files).json()
+    assert len(r["rows"]) == 3 and len(sched()) == 1, r
+    bad = client.post("/api/schedule/parse", headers=dh, files={"file": ("x.doc", b"x", "x")}).json()
+    assert "Eski .doc" in bad["error"], bad
+    for rows in ([{"weekday": 7, "time": "08:00", "subject": "A"}], [{"weekday": 0, "time": "25:00", "subject": "A"}],
+                 [{"weekday": 0, "time": "08:00", "subject": " "}], [{"weekday": True, "time": "08:00", "subject": "A"}], []):
+        assert client.post("/api/schedule/bulk", headers=dh, json={"rows": rows, "mode": "append"}).status_code == 400, rows
+    r = client.post("/api/schedule/bulk", headers=dh, json={"rows": r["rows"], "mode": "replace"}).json()
+    assert r == {"ok": True, "added": 3} and len(sched()) == 3, (r, sched())
 
     # 8) setup va Mini App sahifasi
     assert client.get("/api/setup").status_code == 400  # preview/boshqa domendan emas

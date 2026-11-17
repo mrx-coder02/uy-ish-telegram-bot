@@ -11,6 +11,8 @@ import time
 import uuid
 
 import httpx
+
+from schedule_import import parse_schedule_file
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -1158,7 +1160,8 @@ async def sch_entry(update: ContextTypes.DEFAULT_TYPE, context):
         await update.message.reply_text("❗️ Bu bo'lim sizga ruxsat etilmagan.")
         return ConversationHandler.END
     await update.message.reply_text(
-        "🗓 Qaysi kunga dars qo'shamiz?",
+        "🗓 Qaysi kunga dars qo'shamiz?\n"
+        "💡 Butun jadvalni Excel (.xlsx), Word (.docx) yoki CSV fayl qilib shu chatga yuborsangiz ham bo'ladi.",
         reply_markup=ReplyKeyboardMarkup([[w] for w in WEEKDAYS] + [["❌ Bekor"]], resize_keyboard=True),
     )
     return S_SCH_DAY
@@ -1214,6 +1217,88 @@ def schedule_lines(weekday):
     if not rows:
         return None
     return "\n".join(f"🕐 {r['time']} — {r['subject']}" for r in rows)
+
+
+def save_schedule(rows, replace):
+    """Darslarni saqlash. replace=True — eski jadval o'rniga. Qo'shilgan darslar sonini qaytaradi."""
+    rows = list(dict.fromkeys(tuple(r) for r in rows))
+    with db() as c:
+        old = c.execute("SELECT id, weekday, time, subject FROM schedule").fetchall()
+        have = set() if replace else {(r["weekday"], r["time"], r["subject"]) for r in old}
+        new = [r for r in rows if r not in have]
+        if new:  # bitta so'rovda: yarim yo'lda uzilib qolmasin
+            c.execute(
+                "INSERT INTO schedule(weekday, time, subject) VALUES " + ",".join(["(?,?,?)"] * len(new)),
+                [x for r in new for x in r],
+            )
+        if replace and old:
+            # eskisi yangilar saqlangandan KEYIN o'chadi: xato bo'lsa jadval bo'sh qolmaydi
+            c.execute(f"DELETE FROM schedule WHERE id IN ({','.join('?' * len(old))})", [r["id"] for r in old])
+    return len(new)
+
+
+def schedule_preview(rows):
+    lines = [f"📋 Fayldan {len(rows)} ta dars topildi:"]
+    for wd in range(7):
+        day = [f"   🕐 {t} — {s}" for d, t, s in rows if d == wd]
+        if day:
+            lines += [f"\n{WEEKDAYS[wd]}:"] + day
+    text = "\n".join(lines)
+    return text if len(text) < 3500 else text[:3500] + "\n…"
+
+
+async def schedule_file(update: ContextTypes.DEFAULT_TYPE, context):
+    """Hujjat yuborilsa: o'qituvchidan — dars jadvali fayli sifatida o'qiymiz."""
+    user = get_user_by_tg(update.effective_user.id)
+    if not has_perm(user, "add_lesson"):
+        await update.message.reply_text("❗️ Fayl qabul qilinmaydi. Vazifani rasm yoki matn ko'rinishida yuboring.")
+        return
+    doc = update.message.document
+    if (doc.file_size or 0) > 3 * 1024 * 1024:
+        await update.message.reply_text("❗️ Fayl 3 MB dan katta bo'lmasin.")
+        return
+    try:
+        data = bytes(await (await doc.get_file()).download_as_bytearray())
+        rows = parse_schedule_file(doc.file_name or "", data)
+    except ValueError as e:
+        await update.message.reply_text(f"❗️ {e}")
+        return
+    except Exception:
+        log.exception("Jadval fayli o'qilmadi")
+        await update.message.reply_text("❗️ Faylni o'qib bo'lmadi. Excel (.xlsx), Word (.docx) yoki CSV yuboring.")
+        return
+    context.user_data["sch_import"] = [list(r) for r in rows]
+    await update.message.reply_text(
+        schedule_preview(rows) + "\n\nQanday saqlaymiz?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("♻️ Eski jadval o'rniga", callback_data="schimp:replace")],
+            [InlineKeyboardButton("➕ Mavjud jadvalga qo'shish", callback_data="schimp:append")],
+            [InlineKeyboardButton("❌ Bekor", callback_data="schimp:cancel")],
+        ]),
+    )
+
+
+async def cb_schedule_import(update: ContextTypes.DEFAULT_TYPE, context):
+    q = update.callback_query
+    if not has_perm(get_user_by_tg(update.effective_user.id), "add_lesson"):
+        await q.answer("❗️ Ruxsat yo'q", show_alert=True)
+        return
+    action = q.data.split(":")[1]
+    rows = context.user_data.pop("sch_import", None)
+    if action == "cancel":
+        await q.answer()
+        await q.edit_message_text("❌ Jadval yuklash bekor qilindi.")
+        return
+    if not rows:
+        await q.answer("⌛ Bu tugma eskirgan. Faylni qaytadan yuboring.", show_alert=True)
+        return
+    added = save_schedule(rows, replace=action == "replace")
+    await q.answer("✅ Saqlandi")
+    await q.edit_message_text(
+        f"✅ Dars jadvali saqlandi: {added} ta dars"
+        + (" (eski jadval almashtirildi)." if action == "replace" else " qo'shildi.")
+        + "\n«📅 Dars jadvali» bo'limida ko'rishingiz mumkin."
+    )
 
 
 # ---------------- Rol berish ----------------
@@ -2012,6 +2097,8 @@ def register_handlers(app):
     app.add_handler(MessageHandler(filters.Text([BTN_DEL_SCHEDULE]), del_schedule_menu))
 
     app.add_handler(MessageHandler(filters.CONTACT, login_contact))
+    app.add_handler(MessageHandler(filters.Document.ALL, schedule_file))
+    app.add_handler(CallbackQueryHandler(cb_schedule_import, pattern=r"^schimp:(replace|append|cancel)$"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_menu))
 

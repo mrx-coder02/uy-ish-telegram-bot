@@ -15,6 +15,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 import bot as core
+from schedule_import import parse_schedule_file
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
@@ -303,6 +304,47 @@ async def api_schedule_add(request):
     return json_ok()
 
 
+@require_auth(perm="add_lesson")
+async def api_schedule_parse(request):
+    """Fayldan darslarni o'qib, saqlamasdan qaytaradi (oldindan ko'rish uchun)."""
+    form = await request.form()
+    file = form.get("file")
+    if not file or not hasattr(file, "read"):
+        return jr({"error": "Fayl tanlanmadi"}, status=400)
+    data = await file.read()
+    if len(data) > 3 * 1024 * 1024:
+        return jr({"error": "Fayl 3 MB dan katta bo'lmasin"}, status=400)
+    try:
+        rows = parse_schedule_file(file.filename or "", data)
+    except ValueError as e:
+        return jr({"error": str(e)}, status=400)
+    except Exception:
+        core.log.exception("Jadval fayli o'qilmadi")
+        return jr({"error": "Faylni o'qib bo'lmadi"}, status=400)
+    return jr({"rows": [{"weekday": d, "time": t, "subject": s} for d, t, s in rows]})
+
+
+@require_auth(perm="add_lesson")
+async def api_schedule_bulk(request):
+    try:
+        body = await request.json()
+    except Exception:
+        return jr({"error": "bad_json"}, status=400)
+    rows, mode = body.get("rows"), body.get("mode")
+    if mode not in ("replace", "append") or not isinstance(rows, list) or not 0 < len(rows) <= 300:
+        return jr({"error": "bad_fields"}, status=400)
+    clean = []
+    for r in rows:
+        if not isinstance(r, dict):
+            return jr({"error": "bad_fields"}, status=400)
+        wd, tm, subj = r.get("weekday"), str(r.get("time") or ""), str(r.get("subject") or "").strip()
+        m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", tm)
+        if type(wd) is not int or not 0 <= wd <= 6 or not m or not 0 < len(subj) <= 100:
+            return jr({"error": "bad_fields"}, status=400)
+        clean.append((wd, f"{int(m.group(1)):02d}:{m.group(2)}", subj))
+    return jr({"ok": True, "added": core.save_schedule(clean, replace=mode == "replace")})
+
+
 @require_auth(perm="delete_content")
 async def api_schedule_delete(request):
     sch_id = int(request.path_params["sch_id"])
@@ -515,6 +557,8 @@ ROUTES = [
     Route("/api/schedule", api_schedule),
     Route("/api/schedule", api_schedule_add, methods=["POST"]),
     Route("/api/schedule/{sch_id:int}", api_schedule_delete, methods=["DELETE"]),
+    Route("/api/schedule/parse", api_schedule_parse, methods=["POST"]),
+    Route("/api/schedule/bulk", api_schedule_bulk, methods=["POST"]),
     Route("/api/students", api_students),
     Route("/api/students/brief", api_students_brief),
     Route("/api/students", api_students_add, methods=["POST"]),

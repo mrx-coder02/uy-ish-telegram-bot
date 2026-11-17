@@ -10,6 +10,7 @@ O'quvchi, starosta, o'qituvchi va developer rollari bilan uy vazifalari, eslatma
 - 📚 **Vazifalar matn YOKI rasm ko'rinishida** (ikkalasi birga ham bo'ladi), rasmlar Supabase Storage'ga yuklanadi (ishlamasa lokal `uploads/` papkasida saqlanadi)
 - 📤 O'quvchi vazifani **rasm yoki matn** qilib topshiradi — o'qituvchiga darhol yetib boradi
 - 🗓 **Dars jadvali eslatmalari**: har kuni 19:00 da darsga 3 kun, 2 kun, 1 kun qolganda eslatiladi
+- 📎 **Dars jadvalini fayldan yuklash**: Excel (.xlsx), Word (.docx) yoki CSV faylni botga yuboring yoki Mini App → «🗓 Dars qo'shish»dan yuklang. Jadval avval ko'rsatiladi, keyin «eski jadval o'rniga» yoki «qo'shish» tanlanadi. Faylda hafta kunlari, dars vaqti (08:30) va fan bo'lishi kerak.
 - 🔔 Vazifa eslatmalari: 3/2/1 kun va muddat kuni (08:00), ertangi jadval (19:30), bugungi jadval (07:30)
 - 📱 **Mini App** — Telegram ichida to'liq boshqaruv (o'quvchi uchun ham, o'qituvchi uchun ham)
 - 👑 **Developer paneli** — rollar va ruxsatlarni boshqarish (kim nima qila olishini developer belgilaydi)

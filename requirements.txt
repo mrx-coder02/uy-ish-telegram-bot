@@ -4,3 +4,4 @@ starlette>=0.40
 python-multipart>=0.0.9
 uvicorn>=0.30
 psycopg[binary]>=3.2
+openpyxl>=3.1

@@ -262,6 +262,9 @@ function renderAdd(m){
       <label>Vaqt</label><input id="s_time" placeholder="09:00">
       <label>Fan</label><input id="s_subj" placeholder="Matematika">
       <button class="btn" id="s_go">Jadvalga qo'shish</button>
+      <label>📎 Yoki butun jadvalni fayldan yuklang (Excel .xlsx, Word .docx, CSV)</label>
+      <input type="file" id="s_file" accept=".xlsx,.xlsm,.docx,.csv,.txt">
+      <div id="s_import"></div>
     </div>
   </div>`;
   document.getElementById('tabhw').onclick = ()=>{ setAddTab(true) };
@@ -308,6 +311,33 @@ function renderAdd(m){
       showTab('hw');
     }catch(e){ tg.showAlert('Xatolik: '+(e.error||e)); }
     finally{ tg.MainButton.hideProgress(); }
+  };
+  document.getElementById('s_file').onchange = async e=>{
+    const f = e.target.files[0], box = document.getElementById('s_import');
+    if (!f) return;
+    box.innerHTML = '<div class="meta">⏳ Fayl o\'qilmoqda...</div>';
+    const fd = new FormData(); fd.append('file', f);
+    let d = {}, ok = false;
+    try{
+      const r = await fetch('/api/schedule/parse',{method:'POST', headers:{'X-Init-Data': H['X-Init-Data']}, body:fd});
+      d = await r.json().catch(()=>({})); ok = r.ok;
+    }catch(err){ d = {error:'Internet aloqasini tekshiring'}; }
+    if (!ok){ box.innerHTML = `<div class="meta">❗️ ${esc(d.error||'Xatolik')}</div>`; return; }
+    const DAYS = ['Dushanba','Seshanba','Chorshanba','Payshanba','Juma','Shanba','Yakshanba'];
+    box.innerHTML = `<div class="meta">📋 Fayldan ${d.rows.length} ta dars topildi:</div>`
+      + DAYS.map((n,i)=>{ const l = d.rows.filter(x=>x.weekday===i);
+          return l.length ? `<div class="meta"><b>${n}</b><br>${l.map(x=>esc(x.time+' — '+x.subject)).join('<br>')}</div>` : ''; }).join('')
+      + `<button class="btn" id="s_replace">♻️ Eski jadval o'rniga saqlash</button>`
+      + `<button class="btn gray" id="s_append">➕ Mavjud jadvalga qo'shish</button>`;
+    const save = async mode=>{
+      try{
+        const res = await api('/api/schedule/bulk',{method:'POST', body:JSON.stringify({rows:d.rows, mode})});
+        tg.showAlert(`✅ Dars jadvali saqlandi: ${res.added} ta dars`);
+        TAB='sch'; buildNav(); showTab('sch');
+      }catch(err){ tg.showAlert('Xatolik: '+(err.error||err)); }
+    };
+    document.getElementById('s_replace').onclick = ()=> tg.showConfirm('Eski jadval o\'chirilib, shu jadval qo\'yilsinmi?', yes=>{ if (yes) save('replace'); });
+    document.getElementById('s_append').onclick = ()=> save('append');
   };
   document.getElementById('s_go').onclick = async ()=>{
     try{
