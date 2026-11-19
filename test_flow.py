@@ -362,6 +362,34 @@ with TestClient(entry.app) as client:
     r = client.post("/api/schedule/bulk", headers=dh, json={"rows": r["rows"], "mode": "replace"}).json()
     assert r == {"ok": True, "added": 3} and len(sched()) == 3, (r, sched())
 
+    # 7c) Ism-familiyani o'zgartirish
+    name_of = lambda uid: q("SELECT first_name, last_name FROM users WHERE id=?", (uid,))[0]
+    dev_uid = q("SELECT id FROM users WHERE tg_id=?", (DEV,))[0]["id"]
+    send(upd(DEV, "/ism"))
+    kb = [p for ep, p in CALLS if ep == "sendMessage" and str(p.get("chat_id")) == str(DEV)][-1]["reply_markup"]
+    assert f"renpick:{stu_uid}" in json.dumps(kb), kb
+    send(upd(DEV, cb=f"renpick:{stu_uid}"))
+    send(upd(DEV, "A"))  # juda qisqa
+    assert "2-30" in last_text_to(DEV) and name_of(stu_uid) == {"first_name": "Ali", "last_name": "Valiyev"}
+    send(upd(DEV, "  Alijon   Valiyev  "))
+    assert name_of(stu_uid) == {"first_name": "Alijon", "last_name": "Valiyev"}, name_of(stu_uid)
+    assert q("SELECT count(*) n FROM ptb_state")[0]["n"] == 0
+    send(upd(555, "/ism"))  # o'qituvchi: developer ro'yxatda yo'q, tugmani qo'lda yuborsa ham rad
+    kb = [p for ep, p in CALLS if ep == "sendMessage" and str(p.get("chat_id")) == "555"][-1]["reply_markup"]
+    assert f"renpick:{dev_uid}" not in json.dumps(kb), kb
+    send(upd(555, cb=f"renpick:{dev_uid}"))
+    assert [p for ep, p in CALLS if ep == "answerCallbackQuery"][-1].get("show_alert")
+    send(upd(555, "/cancel"))
+    # Mini App
+    assert client.patch(f"/api/students/{stu_uid}", headers=sh, json={"first_name": "X"}).status_code == 403
+    assert client.patch(f"/api/students/{dev_uid}", headers=th, json={"first_name": "Hacker"}).status_code == 403
+    assert client.patch(f"/api/students/{stu_uid}", headers=th, json={"first_name": "A"}).json()["error"] == "bad_name"
+    assert client.patch("/api/students/999999", headers=th, json={"first_name": "Ali"}).status_code == 404
+    r = client.patch(f"/api/students/{stu_uid}", headers=th, json={"first_name": "Ali", "last_name": "Karimov"})
+    assert r.json() == {"ok": True, "name": "Ali Karimov"}, r.text
+    st = [s_ for s_ in client.get("/api/students", headers=dh).json()["students"] if s_["id"] == stu_uid][0]
+    assert (st["first_name"], st["last_name"], st["name"]) == ("Ali", "Karimov", "Ali Karimov"), st
+
     # 8) setup va Mini App sahifasi
     assert client.get("/api/setup").status_code == 400  # preview/boshqa domendan emas
     s = client.get("https://uy-ish.vercel.app/api/setup").json()

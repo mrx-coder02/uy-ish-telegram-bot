@@ -362,6 +362,8 @@ async def api_students(request):
                 {
                     "id": u["id"],
                     "name": core.display_name(u),
+                    "first_name": u["first_name"],
+                    "last_name": u["last_name"] or "",
                     "phone": u["phone"],
                     "role": u["role"],
                     "role_name": core.ROLE_NAMES[u["role"]],
@@ -398,6 +400,24 @@ async def api_students_add(request):
         user_id = cur.fetchone()["id"]
         core.assign_open_homework(user_id, c)
     return jr({"ok": True, "id": user_id})
+
+
+@require_auth(perm="add_student")
+async def api_students_rename(request):
+    try:
+        body = await request.json()
+    except Exception:
+        return jr({"error": "bad_json"}, status=400)
+    name = core.clean_name(str(body.get("first_name") or ""), str(body.get("last_name") or ""))
+    if not name:
+        return jr({"error": "bad_name"}, status=400)
+    target = core.get_user_by_id(int(request.path_params["uid"]))
+    if not target:
+        return jr({"error": "not_found"}, status=404)
+    if not core.can_edit_user(request["user"], target):
+        return jr({"error": "forbidden"}, status=403)
+    core.rename_user(target["id"], *name)
+    return jr({"ok": True, "name": " ".join(name).strip()})
 
 
 @require_auth(perm="delete_content")
@@ -563,6 +583,7 @@ ROUTES = [
     Route("/api/students/brief", api_students_brief),
     Route("/api/students", api_students_add, methods=["POST"]),
     Route("/api/students/{uid:int}", api_students_delete, methods=["DELETE"]),
+    Route("/api/students/{uid:int}", api_students_rename, methods=["PATCH"]),
     Route("/api/role", api_role_set, methods=["POST"]),
     Route("/api/permissions", api_permissions, methods=["GET", "POST"]),
     Route("/api/stats", api_stats),

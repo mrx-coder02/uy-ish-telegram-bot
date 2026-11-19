@@ -97,6 +97,7 @@ BTN_SET_ROLE = "👤 Rol berish"
 BTN_DEL_HW = "🗑 Uy vazifasi o'chirish"
 BTN_DEL_SCHEDULE = "🗑 Jadval o'chirish"
 BTN_HW_ALL = "👥 Hammaga"
+BTN_RENAME = "✏️ Ismni o'zgartirish"
 BTN_HW_PICK = "✅ O'quvchilarni tanlash"
 BTN_STATS = "📊 Statistika"
 BTN_LOGIN_PHONE = "📱 Telefon raqam bilan kirish"
@@ -109,6 +110,7 @@ S_SCH_DAY, S_SCH_TIME, S_SCH_SUBJ = "sch1", "sch2", "sch3"
 S_ROLE_ID, S_ROLE_ROLE = "role1", "role2"
 S_PEND_NAME = "pend1"
 S_SUBMIT = "sub1"
+S_REN_PICK, S_REN_NAME = "ren1", "ren2"
 
 LOGIN_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
@@ -637,7 +639,7 @@ def menu_keyboard(role):
         rows.append(admin)
     extra = []
     if "add_student" in perms.get(user_role, []) or user_role == "developer":
-        extra.append(BTN_ADD_STUDENT)
+        extra += [BTN_ADD_STUDENT, BTN_RENAME]
     if "view_students" in perms.get(user_role, []) or user_role == "developer":
         extra.append(BTN_STUDENTS)
     if extra:
@@ -1299,6 +1301,81 @@ async def cb_schedule_import(update: ContextTypes.DEFAULT_TYPE, context):
         + (" (eski jadval almashtirildi)." if action == "replace" else " qo'shildi.")
         + "\n«📅 Dars jadvali» bo'limida ko'rishingiz mumkin."
     )
+
+
+# ---------------- Ism-familiyani o'zgartirish ----------------
+def clean_name(first, last):
+    """Ism 2-30, familiya 0-30 belgi; ortiqcha bo'sh joylarsiz. Noto'g'ri bo'lsa None."""
+    first, last = " ".join((first or "").split()), " ".join((last or "").split())
+    return (first, last) if 2 <= len(first) <= 30 and len(last) <= 30 else None
+
+
+def can_edit_user(giver, target):
+    """O'qituvchi o'quvchi/starostani, developer hammani tahrirlaydi (rol berish qoidasi bilan bir xil)."""
+    return (bool(giver and target) and has_perm(giver, "add_student")
+            and target["role"] in role_allowed_for_giver(giver["role"]))
+
+
+def rename_user(user_id, first, last):
+    with db() as c:
+        c.execute("UPDATE users SET first_name=?, last_name=? WHERE id=?", (first, last, user_id))
+
+
+async def ren_entry(update: ContextTypes.DEFAULT_TYPE, context):
+    user = get_user_by_tg(update.effective_user.id)
+    if not has_perm(user, "add_student"):
+        await update.message.reply_text("❗️ Bu bo'lim sizga ruxsat etilmagan.")
+        return ConversationHandler.END
+    users = [u for u in all_users() if can_edit_user(user, u)]
+    if not users:
+        await update.message.reply_text("📭 Tahrirlanadigan foydalanuvchi yo'q.")
+        return ConversationHandler.END
+    # shortcut: Telegram bir xabarda ~100 tugmagacha; sinf uchun yetadi, ko'p bo'lsa sahifalash kerak
+    rows = [[InlineKeyboardButton(f"{display_name(u)} · {ROLE_NAMES[u['role']]}", callback_data=f"renpick:{u['id']}")]
+            for u in users[:90]]
+    await update.message.reply_text(
+        "✏️ Kimning ism-familiyasini o'zgartiramiz?\nBekor qilish: /cancel",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return S_REN_PICK
+
+
+async def ren_cb(update: ContextTypes.DEFAULT_TYPE, context):
+    q = update.callback_query
+    target = get_user_by_id(int(q.data.split(":")[1]))
+    if not can_edit_user(get_user_by_tg(update.effective_user.id), target):
+        await q.answer("❗️ Bu foydalanuvchini tahrirlay olmaysiz", show_alert=True)
+        return S_REN_PICK
+    await q.answer()
+    context.user_data["ren_id"] = target["id"]
+    await q.message.reply_text(
+        f"✏️ Hozir: {display_name(target)}\nYangi ism va familiyani yozing (masalan: Ali Valiyev):",
+        reply_markup=ReplyKeyboardMarkup([["❌ Bekor"]], resize_keyboard=True),
+    )
+    return S_REN_NAME
+
+
+async def ren_name(update: ContextTypes.DEFAULT_TYPE, context):
+    text = update.message.text.strip()
+    if text == "❌ Bekor":
+        return await cancel(update, context)
+    parts = text.split(None, 1)
+    name = clean_name(parts[0] if parts else "", parts[1] if len(parts) > 1 else "")
+    if not name:
+        await update.message.reply_text("❗️ Ism 2-30 harf, familiya 30 harfgacha bo'lsin. Qayta yozing:")
+        return S_REN_NAME
+    user = get_user_by_tg(update.effective_user.id)
+    target = get_user_by_id(context.user_data.pop("ren_id", 0))
+    context.user_data.clear()
+    if not can_edit_user(user, target):  # oradan rol o'zgargan yoki o'chirilgan bo'lishi mumkin
+        await update.message.reply_text("❗️ Bu foydalanuvchini tahrirlay olmaysiz.", reply_markup=menu_keyboard(user["role"]))
+        return ConversationHandler.END
+    rename_user(target["id"], *name)
+    await update.message.reply_text(
+        f"✅ O'zgartirildi: {display_name(target)} → {' '.join(name).strip()}",
+        reply_markup=menu_keyboard(user["role"]),
+    )
+    return ConversationHandler.END
 
 
 # ---------------- Rol berish ----------------
@@ -2077,6 +2154,16 @@ def register_handlers(app):
     app.add_handler(stu_conv)
     app.add_handler(sch_conv)
     app.add_handler(role_conv)
+    app.add_handler(ConversationHandler(
+        name="ren",
+        persistent=True,
+        entry_points=[MessageHandler(filters.Text([BTN_RENAME]), ren_entry), CommandHandler("ism", ren_entry)],
+        states={
+            S_REN_PICK: [CommandHandler("cancel", cancel), CallbackQueryHandler(ren_cb, pattern=r"^renpick:\d+$")],
+            S_REN_NAME: [CommandHandler("cancel", cancel), MessageHandler(filters.TEXT & ~filters.COMMAND, ren_name)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
 
     app.add_handler(CallbackQueryHandler(cb_acc, pattern=r"^acc:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_done, pattern=r"^done:\d+$"))
@@ -2086,7 +2173,7 @@ def register_handlers(app):
     app.add_handler(CallbackQueryHandler(cb_approve, pattern=r"^pay:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_reject, pattern=r"^prej:\d+$"))
     # suhbat tugagach bosilgan eski tanlash tugmalari "yuklanmoqda"da osilib qolmasin
-    app.add_handler(CallbackQueryHandler(stale_button, pattern=r"^(hwsel|rolepick):"))
+    app.add_handler(CallbackQueryHandler(stale_button, pattern=r"^(hwsel|rolepick|renpick):"))
 
     app.add_handler(MessageHandler(filters.Text([BTN_MY_HW]), show_my_homework))
     app.add_handler(MessageHandler(filters.Text([BTN_SCHEDULE]), show_schedule))

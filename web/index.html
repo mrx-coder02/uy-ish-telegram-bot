@@ -386,6 +386,24 @@ async function renderStudents(m){
       <h3>${esc(u.name)}</h3>
       <div class="meta">📱 ${esc(u.phone)||'—'} · ${u.role_name} · ${u.tg_id?'✅ TG ID: '+u.tg_id:'⭕️ Telegram bog\'lanmagan'} · №${u.id}</div>
     </div>`);
+    // server bilan bir xil: o'qituvchi o'quvchi/starostani, developer hammani tahrirlaydi
+    if (canAdd && allowedRoles.includes(u.role)){
+      const eb = el('<button class="btn gray">✏️ Ism-familiyani o\'zgartirish</button>');
+      eb.onclick = ()=>{
+        const f = el(`<div><input placeholder="Ism" value="${esc(u.first_name)}"><input placeholder="Familiya" value="${esc(u.last_name)}">
+          <button class="btn">💾 Saqlash</button><button class="btn gray">Bekor</button></div>`);
+        const [fi, li] = f.querySelectorAll('input'), [sb, cb] = f.querySelectorAll('button');
+        cb.onclick = ()=> showTab('stu');
+        sb.onclick = async ()=>{
+          try{
+            await api('/api/students/'+u.id,{method:'PATCH', body:JSON.stringify({first_name:fi.value, last_name:li.value})});
+            tg.showAlert('✅ Saqlandi'); showTab('stu');
+          }catch(e){ tg.showAlert(e.error==='bad_name' ? 'Ism 2-30 harf, familiya 30 harfgacha bo\'lsin' : 'Xatolik: '+(e.error||e)); }
+        };
+        eb.replaceWith(f); fi.focus();
+      };
+      card.appendChild(eb);
+    }
     if (canRole && (u.role!=='developer' || ME.user.role==='developer')){
       const sel = el(`<select>${roleOptions(u.role)}</select>`);
       sel.onchange = async ()=>{
